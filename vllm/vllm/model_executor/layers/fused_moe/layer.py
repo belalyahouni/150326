@@ -630,29 +630,6 @@ class FusedMoE(CustomOp):
         self.quant_method.create_weights(layer=self, **moe_quant_params)
         self.base_quant_method = self.quant_method
 
-        # Expert cache: keep expert weights on CPU pinned RAM with a
-        # GPU-resident LRU cache for hot experts.
-        self._expert_cache = None
-        self._expert_cache_size = (
-            vllm_config.offload_config.expert_cache_size
-            if vllm_config.offload_config.expert_offload
-            else 0
-        )
-        if self._expert_cache_size > 0:
-            # Move expert weight param data to CPU pinned memory so that
-            # weight loading writes directly to CPU. Dense weights
-            # (attention, layernorm, router gate) stay on GPU.
-            if hasattr(self, "w13_weight"):
-                cpu_w13 = self.w13_weight.data.cpu().pin_memory()
-                self.w13_weight = torch.nn.Parameter(
-                    cpu_w13, requires_grad=False
-                )
-            if hasattr(self, "w2_weight"):
-                cpu_w2 = self.w2_weight.data.cpu().pin_memory()
-                self.w2_weight = torch.nn.Parameter(
-                    cpu_w2, requires_grad=False
-                )
-
         # Disable shared expert overlap if:
         #   - we are using eplb with non-default backend, because of correctness issues
         #   - we are using flashinfer with DP, since there nothing to gain
@@ -725,52 +702,6 @@ class FusedMoE(CustomOp):
                 )
             )
 
-        # Initialize expert cache after all weights are loaded.
-        self._maybe_init_expert_cache()
-
-    def _maybe_init_expert_cache(self) -> None:
-        """Construct the GPU expert cache if expert offloading is enabled.
-
-        Called after all weights are loaded and post-processed.  The cache
-        is pre-populated with the first ``cache_size`` experts so it is
-        warm before the first inference token.
-        """
-        if self._expert_cache is not None or self._expert_cache_size <= 0:
-            return
-        if not hasattr(self, "w13_weight") or not hasattr(self, "w2_weight"):
-            return
-
-        from vllm.model_executor.layers.fused_moe.expert_cache import (
-            ExpertCache,
-        )
-
-        cpu_w13 = self.w13_weight.data
-        cpu_w2 = self.w2_weight.data
-        if not cpu_w13.is_pinned():
-            cpu_w13 = cpu_w13.pin_memory()
-            self.w13_weight = torch.nn.Parameter(
-                cpu_w13, requires_grad=False
-            )
-        if not cpu_w2.is_pinned():
-            cpu_w2 = cpu_w2.pin_memory()
-            self.w2_weight = torch.nn.Parameter(
-                cpu_w2, requires_grad=False
-            )
-
-        device = torch.device("cuda", torch.cuda.current_device())
-        cache_size = min(self._expert_cache_size, cpu_w13.shape[0])
-        self._expert_cache = ExpertCache(
-            cache_size=cache_size,
-            cpu_w13=cpu_w13,
-            cpu_w2=cpu_w2,
-            device=device,
-        )
-        logger.info(
-            "Expert cache initialized for %s: %d/%d experts cached",
-            self.moe_config,
-            cache_size,
-            cpu_w13.shape[0],
-        )
 
     @property
     def shared_experts(self) -> torch.nn.Module | None:
@@ -1570,81 +1501,10 @@ class FusedMoE(CustomOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if self._expert_cache is not None:
-            return self._forward_with_expert_cache(hidden_states, router_logits)
         return self.runner.forward(
             hidden_states,
             router_logits,
         )
-
-    def _forward_with_expert_cache(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass using the GPU expert cache.
-
-        1. Route tokens to experts.
-        2. Ensure needed experts are in the GPU cache (DMA on miss).
-        3. Gather cached weights, remap expert IDs to local indices.
-        4. Temporarily swap layer attributes so the kernel sees only
-           the needed experts, then call ``quant_method.apply``.
-        5. Restore original attributes.
-        """
-        assert self._expert_cache is not None
-
-        # --- Router ---
-        topk_weights, topk_ids = self.runner.router.select_experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
-
-        # --- Unique experts needed for this batch ---
-        needed = topk_ids.unique().tolist()
-
-        # --- Ensure all needed experts are in the GPU cache ---
-        self._expert_cache.ensure(needed)
-
-        # --- Gather cached weights ---
-        temp_w13, temp_w2 = self._expert_cache.get_cached_weights(needed)
-
-        # --- Remap global expert IDs → local indices [0..len(needed)-1] ---
-        id_map = {global_id: local_idx for local_idx, global_id in enumerate(needed)}
-        remapped_ids = topk_ids.clone()
-        for global_id, local_idx in id_map.items():
-            remapped_ids[topk_ids == global_id] = local_idx
-
-        # --- Swap layer attributes temporarily ---
-        orig_w13 = self.w13_weight.data
-        orig_w2 = self.w2_weight.data
-        orig_num_experts = self.global_num_experts
-        orig_expert_map = self._expert_map
-
-        try:
-            self.w13_weight.data = temp_w13
-            self.w2_weight.data = temp_w2
-            self.global_num_experts = len(needed)
-            self._expert_map = None
-
-            # --- Kernel call ---
-            result = self.quant_method.apply(
-                layer=self,
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=remapped_ids,
-                shared_experts_input=None,
-            )
-        finally:
-            # --- Restore ---
-            self.w13_weight.data = orig_w13
-            self.w2_weight.data = orig_w2
-            self.global_num_experts = orig_num_experts
-            self._expert_map = orig_expert_map
-
-        # --- Update LRU ---
-        self._expert_cache.record_use(needed)
-
-        return result
 
     @property
     def expert_map(self) -> torch.Tensor | None:

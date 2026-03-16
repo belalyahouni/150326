@@ -94,18 +94,6 @@ class OffloadConfig:
     prefetch: PrefetchOffloadConfig = Field(default_factory=PrefetchOffloadConfig)
     """Parameters for prefetch offloading backend."""
 
-    expert_offload: bool = False
-    """Enable MoE expert weight offloading. When enabled, expert weights
-    (w13, w2) are kept on CPU pinned RAM and a GPU-resident LRU cache holds
-    the hottest experts. Dense weights (attention, layernorm, router gate)
-    remain on GPU. Separate from --cpu-offload-gb / UVA offloading."""
-
-    expert_cache_size: int = Field(default=0, ge=0)
-    """Number of MoE expert slots to cache on GPU per layer. Only used when
-    expert_offload is True. When 0, all experts are cached (effectively no
-    eviction). Example: for a 256-expert model, setting this to 32 keeps
-    32 expert replicas on GPU and evicts LRU experts on cache miss."""
-
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
         """Validate offload configuration constraints."""
