@@ -1603,7 +1603,7 @@ class FusedMoE(CustomOp):
         needed = topk_ids.unique().tolist()
 
         # --- Ensure all needed experts are in the GPU cache ---
-        self._expert_cache.ensure(needed)
+        self._expert_cache.ensure_experts_loaded(needed)
 
         # --- Gather cached weights ---
         temp_w13, temp_w2 = self._expert_cache.get_cached_weights(needed)

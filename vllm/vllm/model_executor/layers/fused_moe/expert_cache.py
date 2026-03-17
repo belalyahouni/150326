@@ -79,7 +79,7 @@ class ExpertCache:
             self.cache_w2[slot].copy_(self.cpu_w2[expert_id])
             self.expert_to_slot[expert_id] = slot
             self.lru_order[expert_id] = None
-        torch.cuda.synchronize(self.device)
+
         logger.info(
             "ExpertCache: warmed %d/%d experts on %s "
             "(w13: %s, w2: %s)",
@@ -90,59 +90,81 @@ class ExpertCache:
             list(self.cache_w2.shape),
         )
 
-    def ensure(self, needed_ids: list[int]) -> None:
-        """Ensure all ``needed_ids`` are present in the GPU cache.
+    def ensure_experts_loaded(self, needed_expert_ids: list[int]) -> None:
+        """Ensure all ``needed_expert_ids`` are present in the GPU cache.
 
-        Cache hits are free. Misses evict the LRU expert and DMA the
-        needed expert from CPU pinned RAM into the freed slot.
+        Uses a two-pass approach to avoid evicting an expert that is itself
+        needed in the same batch:
+          Pass 1 — classify each expert as a hit or miss.
+          Pass 2 — for each miss, evict the coldest cached expert that is
+                   not in the needed set (walking lru_order LRU→MRU so the
+                   hottest non-needed survivors are preserved), then assign
+                   that slot to the incoming expert.
+          Pass 3 — batch all CPU→GPU DMA copies on the transfer stream and
+                   make the compute stream wait.
 
         After this call returns, the compute stream is safe to read from
-        the cache slots for all ``needed_ids``.
+        the cache slots for all ``needed_expert_ids``.
+
+        # TODO: consider coalescing per-expert cudaMemcpyAsync calls into
+        # fewer larger transfers if expert tensors are small and miss counts
+        # are high.
         """
-        misses: list[tuple[int, int]] = []  # (expert_id, slot)
+        needed_set = set(needed_expert_ids)
 
-        for eid in needed_ids:
-            if eid in self.expert_to_slot:
+        # --- Pass 1: classify hits and misses ---
+        missing_expert_ids: list[int] = []
+        for expert_id in needed_expert_ids:
+            if expert_id in self.expert_to_slot:
                 self.hits += 1
-                continue
+            else:
+                self.misses += 1
+                missing_expert_ids.append(expert_id)
 
-            # Cache miss — need a slot
-            self.misses += 1
+        if not missing_expert_ids:
+            return
 
-            # Evict LRU expert
-            lru_expert, _ = self.lru_order.popitem(last=False)
-            slot = self.expert_to_slot.pop(lru_expert)
+        # --- Pass 2: evict coldest non-needed experts, assign slots ---
+        # lru_order is oldest-first, so iterating from the left gives us
+        # the coldest candidates first — hottest non-needed experts survive.
+        eviction_candidates = (
+            expert_id
+            for expert_id in self.lru_order
+            if expert_id not in needed_set
+        )
+        experts_and_slots_to_copy: list[tuple[int, int]] = []  # (expert_id, slot)
+        for expert_id in missing_expert_ids:
+            evicted_expert_id = next(eviction_candidates)
+            slot = self.expert_to_slot.pop(evicted_expert_id)
+            del self.lru_order[evicted_expert_id]
 
-            self.expert_to_slot[eid] = slot
-            self.lru_order[eid] = None  # Add as MRU
-            misses.append((eid, slot))
+            self.expert_to_slot[expert_id] = slot
+            self.lru_order[expert_id] = None  # Add as MRU
+            experts_and_slots_to_copy.append((expert_id, slot))
 
-        if misses:
-            # DMA copies on the transfer stream
-            with torch.cuda.stream(self.transfer_stream):
-                for eid, slot in misses:
-                    self.cache_w13[slot].copy_(self.cpu_w13[eid], non_blocking=True)
-                    self.cache_w2[slot].copy_(self.cpu_w2[eid], non_blocking=True)
+        # --- Pass 3: batch DMA CPU→GPU ---
+        with torch.cuda.stream(self.transfer_stream):
+            for expert_id, slot in experts_and_slots_to_copy:
+                self.cache_w13[slot].copy_(self.cpu_w13[expert_id], non_blocking=True)
+                self.cache_w2[slot].copy_(self.cpu_w2[expert_id], non_blocking=True)
 
-            # Make the default (compute) stream wait for transfers
-            torch.cuda.current_stream(self.device).wait_stream(
-                self.transfer_stream
-            )
+        # Make the default (compute) stream wait for transfers
+        torch.cuda.current_stream(self.device).wait_stream(self.transfer_stream)
 
     def get_cached_weights(
-        self, needed_ids: list[int]
+        self, needed_expert_ids: list[int]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather cached expert weights into contiguous tensors.
 
         Args:
-            needed_ids: Expert IDs that are guaranteed to be in the cache
-                (call ``ensure`` first).
+            needed_expert_ids: Expert IDs that are guaranteed to be in the cache
+                (call ``ensure_experts_loaded`` first).
 
         Returns:
-            ``(temp_w13, temp_w2)`` each of shape ``[len(needed_ids), ...]``
-            indexed as local experts ``0..len(needed_ids)-1``.
+            ``(temp_w13, temp_w2)`` each of shape ``[len(needed_expert_ids), ...]``
+            indexed as local experts ``0..len(needed_expert_ids)-1``.
         """
-        slots = [self.expert_to_slot[eid] for eid in needed_ids]
+        slots = [self.expert_to_slot[expert_id] for expert_id in needed_expert_ids]
         slot_indices = torch.tensor(slots, dtype=torch.long, device=self.device)
         temp_w13 = self.cache_w13[slot_indices]
         temp_w2 = self.cache_w2[slot_indices]
@@ -150,9 +172,9 @@ class ExpertCache:
 
     def record_use(self, expert_ids: list[int]) -> None:
         """Move ``expert_ids`` to the MRU end of the LRU list."""
-        for eid in expert_ids:
+        for expert_id in expert_ids:
             # move_to_end(last=True) makes it the most-recently-used
-            self.lru_order.move_to_end(eid, last=True)
+            self.lru_order.move_to_end(expert_id, last=True)
 
     def log_stats(self) -> None:
         total = self.hits + self.misses
