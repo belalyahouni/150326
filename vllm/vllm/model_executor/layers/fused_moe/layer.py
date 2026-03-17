@@ -1586,9 +1586,10 @@ class FusedMoE(CustomOp):
 
         1. Route tokens to experts.
         2. Ensure needed experts are in the GPU cache (DMA on miss).
-        3. Gather cached weights, remap expert IDs to local indices.
-        4. Temporarily swap layer attributes so the kernel sees only
-           the needed experts, then call ``quant_method.apply``.
+        3. Remap expert IDs to cache slot indices so the kernel indexes
+           directly into the cache buffers (no gather/copy needed).
+        4. Temporarily swap layer attributes so the kernel reads from
+           the cache buffers, then call ``quant_method.apply``.
         5. Restore original attributes.
         """
         assert self._expert_cache is not None
@@ -1600,19 +1601,19 @@ class FusedMoE(CustomOp):
         )
 
         # --- Unique experts needed for this batch ---
-        needed = topk_ids.unique().tolist()
+        needed_expert_ids = topk_ids.unique().tolist()
 
         # --- Ensure all needed experts are in the GPU cache ---
-        self._expert_cache.ensure_experts_loaded(needed)
+        self._expert_cache.ensure_experts_loaded(needed_expert_ids)
 
-        # --- Gather cached weights ---
-        temp_w13, temp_w2 = self._expert_cache.get_cached_weights(needed)
-
-        # --- Remap global expert IDs → local indices [0..len(needed)-1] ---
-        id_map = {global_id: local_idx for local_idx, global_id in enumerate(needed)}
+        # --- Remap global expert IDs → cache slot indices ---
+        # The kernel indexes into the weight tensor using topk_ids.
+        # Cache slot indices let it read directly from the cache buffers
+        # without an intermediate gather copy.
+        expert_to_slot = self._expert_cache.expert_to_slot
         remapped_ids = topk_ids.clone()
-        for global_id, local_idx in id_map.items():
-            remapped_ids[topk_ids == global_id] = local_idx
+        for global_id in needed_expert_ids:
+            remapped_ids[topk_ids == global_id] = expert_to_slot[global_id]
 
         # --- Swap layer attributes temporarily ---
         orig_w13 = self.w13_weight.data
@@ -1621,9 +1622,9 @@ class FusedMoE(CustomOp):
         orig_expert_map = self._expert_map
 
         try:
-            self.w13_weight.data = temp_w13
-            self.w2_weight.data = temp_w2
-            self.global_num_experts = len(needed)
+            self.w13_weight.data = self._expert_cache.cache_w13
+            self.w2_weight.data = self._expert_cache.cache_w2
+            self.global_num_experts = self._expert_cache.cache_size
             self._expert_map = None
 
             # --- Kernel call ---
@@ -1642,7 +1643,7 @@ class FusedMoE(CustomOp):
             self._expert_map = orig_expert_map
 
         # --- Update LRU ---
-        self._expert_cache.record_use(needed)
+        self._expert_cache.mark_recently_used(needed_expert_ids)
 
         return result
 

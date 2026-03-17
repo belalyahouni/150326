@@ -151,26 +151,7 @@ class ExpertCache:
         # Make the default (compute) stream wait for transfers
         torch.cuda.current_stream(self.device).wait_stream(self.transfer_stream)
 
-    def get_cached_weights(
-        self, needed_expert_ids: list[int]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Gather cached expert weights into contiguous tensors.
-
-        Args:
-            needed_expert_ids: Expert IDs that are guaranteed to be in the cache
-                (call ``ensure_experts_loaded`` first).
-
-        Returns:
-            ``(temp_w13, temp_w2)`` each of shape ``[len(needed_expert_ids), ...]``
-            indexed as local experts ``0..len(needed_expert_ids)-1``.
-        """
-        slots = [self.expert_to_slot[expert_id] for expert_id in needed_expert_ids]
-        slot_indices = torch.tensor(slots, dtype=torch.long, device=self.device)
-        temp_w13 = self.cache_w13[slot_indices]
-        temp_w2 = self.cache_w2[slot_indices]
-        return temp_w13, temp_w2
-
-    def record_use(self, expert_ids: list[int]) -> None:
+    def mark_recently_used(self, expert_ids: list[int]) -> None:
         """Move ``expert_ids`` to the MRU end of the LRU list."""
         for expert_id in expert_ids:
             # move_to_end(last=True) makes it the most-recently-used

@@ -1,0 +1,39 @@
+vllm bench serve \
+  --backend vllm \
+  --endpoint /v1/completions \
+  --num-prompts 5 \
+  --dataset-name random \
+  --input-len 100 \
+  --output-len 100 \
+  --max-concurrency 1 \
+  --trust-remote-code \
+  --num-warmups 2
+  
+VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY=1 python3 -m vllm.entrypoints.openai.api_server         --model mistralai/Mixtral-8x7B-Instruct-v0.1         --tensor-parallel-size 2         --cpu-offload-gb 160         --cpu-offload-params w13_weight w2_weight
+============ Serving Benchmark Result ============
+Successful requests:                     5         
+Failed requests:                         0         
+Maximum request concurrency:             1         
+Benchmark duration (s):                  233.36    
+Total input tokens:                      495       
+Total generated tokens:                  500       
+Request throughput (req/s):              0.02      
+Output token throughput (tok/s):         2.14      
+Peak output token throughput (tok/s):    3.00      
+Peak concurrent requests:                2.00      
+Total token throughput (tok/s):          4.26      
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1717.29   
+Median TTFT (ms):                        1897.86   
+P99 TTFT (ms):                           1911.21   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          454.07    
+Median TPOT (ms):                        454.08    
+P99 TPOT (ms):                           454.10    
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           454.07    
+Median ITL (ms):                         454.07    
+P99 ITL (ms):                            454.84    
+==================================================
+
+VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY=1 python3 -m vllm.entrypoints.openai.api_server         --model mistralai/Mixtral-8x7B-Instruct-v0.1         --tensor-parallel-size 2         --cpu-offload-gb 160         --cpu-offload-params w13_weight w2_weight
