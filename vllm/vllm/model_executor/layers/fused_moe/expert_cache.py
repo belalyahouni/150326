@@ -60,7 +60,6 @@ class ExpertCache:
         self.expert_to_slot: dict[int, int] = {}
         # OrderedDict: oldest-first iteration order
         self.lru_order: OrderedDict[int, None] = OrderedDict()
-        self.free_slots: list[int] = []
 
         # Dedicated DMA stream for async CPU→GPU copies
         self.transfer_stream = torch.cuda.Stream(device=device)
@@ -110,12 +109,9 @@ class ExpertCache:
             # Cache miss — need a slot
             self.misses += 1
 
-            if self.free_slots:
-                slot = self.free_slots.pop()
-            else:
-                # Evict LRU expert
-                lru_expert, _ = self.lru_order.popitem(last=False)
-                slot = self.expert_to_slot.pop(lru_expert)
+            # Evict LRU expert
+            lru_expert, _ = self.lru_order.popitem(last=False)
+            slot = self.expert_to_slot.pop(lru_expert)
 
             self.expert_to_slot[eid] = slot
             self.lru_order[eid] = None  # Add as MRU
