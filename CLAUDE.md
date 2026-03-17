@@ -12,3 +12,6 @@
 |---|---|---|
 | Small KV budget / large expert budget | Unified pool should win (evict experts for KV) | Baseline is fine |
 | Large KV budget / small expert budget | Baseline is fine | Unified pool should win (evict KV for experts) |
+
+**Instructions:**
+Always plan before implementing. Only implement when asked to. If anything goes not according to the plan during implmentation, do not push through, come back and plan again.

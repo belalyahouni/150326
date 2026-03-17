@@ -58,7 +58,6 @@ class ExpertCache:
 
         # LRU tracking
         self.expert_to_slot: dict[int, int] = {}
-        self.slot_to_expert: dict[int, int] = {}
         # OrderedDict: oldest-first iteration order
         self.lru_order: OrderedDict[int, None] = OrderedDict()
         self.free_slots: list[int] = []
@@ -80,7 +79,6 @@ class ExpertCache:
             self.cache_w13[slot].copy_(self.cpu_w13[expert_id])
             self.cache_w2[slot].copy_(self.cpu_w2[expert_id])
             self.expert_to_slot[expert_id] = slot
-            self.slot_to_expert[slot] = expert_id
             self.lru_order[expert_id] = None
         torch.cuda.synchronize(self.device)
         logger.info(
@@ -118,10 +116,8 @@ class ExpertCache:
                 # Evict LRU expert
                 lru_expert, _ = self.lru_order.popitem(last=False)
                 slot = self.expert_to_slot.pop(lru_expert)
-                del self.slot_to_expert[slot]
 
             self.expert_to_slot[eid] = slot
-            self.slot_to_expert[slot] = eid
             self.lru_order[eid] = None  # Add as MRU
             misses.append((eid, slot))
 
