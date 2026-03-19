@@ -631,27 +631,16 @@ class FusedMoE(CustomOp):
         self.base_quant_method = self.quant_method
 
         # Expert cache: keep expert weights on CPU pinned RAM with a
-        # GPU-resident LRU cache for hot experts.
+        # GPU-resident LRU cache for hot experts.  Actual CPU pinning
+        # happens in _maybe_init_expert_cache() AFTER weights are loaded,
+        # so we don't strip the weight_loader attribute needed by vLLM's
+        # weight loading system.
         self._expert_cache = None
         self._expert_cache_size = (
             vllm_config.offload_config.expert_cache_size
             if vllm_config.offload_config.expert_offload
             else 0
         )
-        if self._expert_cache_size > 0:
-            # Move expert weight param data to CPU pinned memory so that
-            # weight loading writes directly to CPU. Dense weights
-            # (attention, layernorm, router gate) stay on GPU.
-            if hasattr(self, "w13_weight"):
-                cpu_w13 = self.w13_weight.data.cpu().pin_memory()
-                self.w13_weight = torch.nn.Parameter(
-                    cpu_w13, requires_grad=False
-                )
-            if hasattr(self, "w2_weight"):
-                cpu_w2 = self.w2_weight.data.cpu().pin_memory()
-                self.w2_weight = torch.nn.Parameter(
-                    cpu_w2, requires_grad=False
-                )
 
         # Disable shared expert overlap if:
         #   - we are using eplb with non-default backend, because of correctness issues
@@ -746,16 +735,22 @@ class FusedMoE(CustomOp):
 
         cpu_w13 = self.w13_weight.data
         cpu_w2 = self.w2_weight.data
+        # Move to CPU if still on GPU (weights are loaded on GPU by default)
+        if cpu_w13.is_cuda:
+            cpu_w13 = cpu_w13.cpu()
+        if cpu_w2.is_cuda:
+            cpu_w2 = cpu_w2.cpu()
+        # Pin memory for async DMA transfers
         if not cpu_w13.is_pinned():
             cpu_w13 = cpu_w13.pin_memory()
-            self.w13_weight = torch.nn.Parameter(
-                cpu_w13, requires_grad=False
-            )
         if not cpu_w2.is_pinned():
             cpu_w2 = cpu_w2.pin_memory()
-            self.w2_weight = torch.nn.Parameter(
-                cpu_w2, requires_grad=False
-            )
+        self.w13_weight = torch.nn.Parameter(
+            cpu_w13, requires_grad=False
+        )
+        self.w2_weight = torch.nn.Parameter(
+            cpu_w2, requires_grad=False
+        )
 
         device = torch.device("cuda", torch.cuda.current_device())
         cache_size = min(self._expert_cache_size, cpu_w13.shape[0])

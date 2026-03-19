@@ -4586,6 +4586,15 @@ class GPUModelRunner(
                 drafter_model := getattr(drafter, "model", None)
             ):
                 prepare_communication_buffer_for_model(drafter_model)
+
+            # Initialize expert caches for MoE layers after weights are loaded.
+            # This must happen before profile_run / torch.compile tracing.
+            if self.vllm_config.offload_config.expert_offload:
+                from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+                for module in self.model.modules():
+                    if isinstance(module, FusedMoE):
+                        module._maybe_init_expert_cache()
+
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())

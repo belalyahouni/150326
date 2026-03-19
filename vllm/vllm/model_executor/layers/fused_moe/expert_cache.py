@@ -114,12 +114,16 @@ class ExpertCache:
 
         # --- Pass 1: classify hits and misses ---
         missing_expert_ids: list[int] = []
+        hit_ids: list[int] = []
         for expert_id in needed_expert_ids:
             if expert_id in self.expert_to_slot:
                 self.hits += 1
+                hit_ids.append(expert_id)
             else:
                 self.misses += 1
                 missing_expert_ids.append(expert_id)
+
+        print(f"ExpertCache: needed={needed_expert_ids} hits={hit_ids} misses={missing_expert_ids}", flush=True)
 
         if not missing_expert_ids:
             return
@@ -127,16 +131,17 @@ class ExpertCache:
         # --- Pass 2: evict coldest non-needed experts, assign slots ---
         # lru_order is oldest-first, so iterating from the left gives us
         # the coldest candidates first — hottest non-needed experts survive.
-        eviction_candidates = (
+        eviction_candidates = iter([
             expert_id
             for expert_id in self.lru_order
             if expert_id not in needed_set
-        )
+        ])
         experts_and_slots_to_copy: list[tuple[int, int]] = []  # (expert_id, slot)
         for expert_id in missing_expert_ids:
             evicted_expert_id = next(eviction_candidates)
             slot = self.expert_to_slot.pop(evicted_expert_id)
             del self.lru_order[evicted_expert_id]
+            print(f"ExpertCache: evict expert {evicted_expert_id} from slot {slot}, load expert {expert_id}", flush=True)
 
             self.expert_to_slot[expert_id] = slot
             self.lru_order[expert_id] = None  # Add as MRU
