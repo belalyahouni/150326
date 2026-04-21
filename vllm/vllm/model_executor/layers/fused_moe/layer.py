@@ -641,6 +641,14 @@ class FusedMoE(CustomOp):
             if vllm_config.offload_config.expert_offload
             else 0
         )
+        # Unified KV+expert page pool (Phase 1 "Design D"). The manager is
+        # created later in the worker; we just reserve the attribute here so
+        # the dispatch in forward_native works regardless of init order.
+        self._unified_pool = None
+        self._unified_pool_enabled = (
+            vllm_config.offload_config.expert_unified_pool
+            and vllm_config.offload_config.expert_offload
+        )
 
         # Disable shared expert overlap if:
         #   - we are using eplb with non-default backend, because of correctness issues
@@ -717,6 +725,27 @@ class FusedMoE(CustomOp):
         # Initialize expert cache after all weights are loaded.
         self._maybe_init_expert_cache()
 
+    def move_experts_to_cpu(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Move expert weights (w13, w2) to CPU pinned memory in-place.
+
+        Idempotent: if the weights are already on CPU and pinned, returns
+        them unchanged. Returns ``(cpu_w13, cpu_w2)`` for callers that want
+        to stash references (e.g. the unified pool manager).
+        """
+        cpu_w13 = self.w13_weight.data
+        cpu_w2 = self.w2_weight.data
+        if cpu_w13.is_cuda:
+            cpu_w13 = cpu_w13.cpu()
+        if cpu_w2.is_cuda:
+            cpu_w2 = cpu_w2.cpu()
+        if not cpu_w13.is_pinned():
+            cpu_w13 = cpu_w13.pin_memory()
+        if not cpu_w2.is_pinned():
+            cpu_w2 = cpu_w2.pin_memory()
+        self.w13_weight = torch.nn.Parameter(cpu_w13, requires_grad=False)
+        self.w2_weight = torch.nn.Parameter(cpu_w2, requires_grad=False)
+        return cpu_w13, cpu_w2
+
     def _maybe_init_expert_cache(self) -> None:
         """Construct the GPU expert cache if expert offloading is enabled.
 
@@ -726,6 +755,9 @@ class FusedMoE(CustomOp):
         """
         if self._expert_cache is not None or self._expert_cache_size <= 0:
             return
+        # Unified pool owns expert residency; do not also build an ExpertCache.
+        if self._unified_pool_enabled:
+            return
         if not hasattr(self, "w13_weight") or not hasattr(self, "w2_weight"):
             return
 
@@ -733,24 +765,7 @@ class FusedMoE(CustomOp):
             ExpertCache,
         )
 
-        cpu_w13 = self.w13_weight.data
-        cpu_w2 = self.w2_weight.data
-        # Move to CPU if still on GPU (weights are loaded on GPU by default)
-        if cpu_w13.is_cuda:
-            cpu_w13 = cpu_w13.cpu()
-        if cpu_w2.is_cuda:
-            cpu_w2 = cpu_w2.cpu()
-        # Pin memory for async DMA transfers
-        if not cpu_w13.is_pinned():
-            cpu_w13 = cpu_w13.pin_memory()
-        if not cpu_w2.is_pinned():
-            cpu_w2 = cpu_w2.pin_memory()
-        self.w13_weight = torch.nn.Parameter(
-            cpu_w13, requires_grad=False
-        )
-        self.w2_weight = torch.nn.Parameter(
-            cpu_w2, requires_grad=False
-        )
+        cpu_w13, cpu_w2 = self.move_experts_to_cpu()
 
         device = torch.device("cuda", torch.cuda.current_device())
         cache_size = min(self._expert_cache_size, cpu_w13.shape[0])
@@ -1565,12 +1580,66 @@ class FusedMoE(CustomOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self._unified_pool is not None:
+            return self._forward_with_unified_pool(hidden_states, router_logits)
         if self._expert_cache is not None:
             return self._forward_with_expert_cache(hidden_states, router_logits)
         return self.runner.forward(
             hidden_states,
             router_logits,
         )
+
+    def _forward_with_unified_pool(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass using the unified KV+expert page pool (Design D).
+
+        1. Route tokens to experts.
+        2. Ask the pool manager to make sure all needed experts are resident
+           and pinned; misses trigger CPU→GPU DMA on the transfer stream and
+           a ``wait_stream`` simulation-fidelity barrier.
+        3. Swap ``w13_weight.data`` / ``w2_weight.data`` to the layer's full
+           static staging tensors. ``global_num_experts`` is unchanged and
+           ``topk_ids`` is NOT remapped — staging is full width, so native
+           kernel indexing already works.
+        4. Run the kernel, restore originals in ``finally``.
+        5. Release the pinned pages; no GPU sync needed (the kernel reads
+           staging, never pool pages).
+        """
+        assert self._unified_pool is not None
+
+        topk_weights, topk_ids = self.runner.router.select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+        )
+
+        needed_expert_ids = topk_ids.unique().tolist()
+        layer_idx = self.layer_id
+        manager = self._unified_pool
+        manager.ensure_experts_loaded(layer_idx, needed_expert_ids)
+        layer_pool = manager.pools[layer_idx]
+
+        orig_w13 = self.w13_weight.data
+        orig_w2 = self.w2_weight.data
+        try:
+            self.w13_weight.data = layer_pool.staging_w13
+            self.w2_weight.data = layer_pool.staging_w2
+            result = self.quant_method.apply(
+                layer=self,
+                x=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                shared_experts_input=None,
+            )
+        finally:
+            self.w13_weight.data = orig_w13
+            self.w2_weight.data = orig_w2
+
+        manager.release_after_forward(layer_idx)
+        manager.maybe_log_stats()
+        return result
 
     def _forward_with_expert_cache(
         self,

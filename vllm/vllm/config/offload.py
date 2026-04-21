@@ -106,9 +106,20 @@ class OffloadConfig:
     eviction). Example: for a 256-expert model, setting this to 32 keeps
     32 expert replicas on GPU and evicts LRU experts on cache miss."""
 
+    expert_unified_pool: bool = False
+    """Enable the unified per-layer page pool that shares GPU VRAM between KV
+    cache and expert cache via the scheduler's free-block LRU. Requires
+    expert_offload=True and enable_prefix_caching=True. Uniprocess only
+    (tensor_parallel_size == 1, pipeline_parallel_size == 1)."""
+
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
         """Validate offload configuration constraints."""
+        if self.expert_unified_pool and not self.expert_offload:
+            raise ValueError(
+                "expert_unified_pool=True requires expert_offload=True"
+            )
+
         if self.offload_backend == "prefetch" or self.prefetch.offload_group_size > 0:
             if self.prefetch.offload_num_in_group > self.prefetch.offload_group_size:
                 raise ValueError(

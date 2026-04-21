@@ -528,6 +528,17 @@ class Worker(WorkerBase):
             self.model_runner.update_max_model_len(max_model_len)
         logger.debug("Updated max_model_len to %d", max_model_len)
 
+    def setup_unified_pool(self, block_pool) -> None:
+        """Build the unified KV+expert page pool manager on the worker side.
+
+        Dispatched from ``EngineCore`` via ``collective_rpc`` after the
+        scheduler is constructed.
+        """
+        self.model_runner._setup_unified_pool_manager(block_pool)
+
+    def get_unified_pool_block_count(self) -> int | None:
+        return self.model_runner.get_unified_pool_block_count()
+
     @instrument(span_name="Allocate KV cache")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""

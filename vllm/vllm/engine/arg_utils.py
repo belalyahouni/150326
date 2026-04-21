@@ -455,6 +455,7 @@ class EngineArgs:
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
     expert_offload: bool = OffloadConfig.expert_offload
     expert_cache_size: int = get_field(OffloadConfig, "expert_cache_size")
+    expert_unified_pool: bool = OffloadConfig.expert_unified_pool
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1036,6 +1037,9 @@ class EngineArgs:
         )
         offload_group.add_argument(
             "--expert-cache-size", **offload_kwargs["expert_cache_size"]
+        )
+        offload_group.add_argument(
+            "--expert-unified-pool", **offload_kwargs["expert_unified_pool"]
         )
 
         # Multimodal related configs
@@ -1919,6 +1923,7 @@ class EngineArgs:
             ),
             expert_offload=self.expert_offload,
             expert_cache_size=self.expert_cache_size,
+            expert_unified_pool=self.expert_unified_pool,
         )
 
         if self.gdn_prefill_backend is not None:

@@ -180,6 +180,12 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
+        # Callbacks fired from get_new_blocks after the block is evicted from
+        # any prefix-cache hash but before the caller writes new data into it.
+        # Used by the unified KV+expert page pool so the worker can invalidate
+        # stale expert mappings at a page when the scheduler reclaims it.
+        self._on_alloc_callbacks: list[Any] = []
+
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -347,7 +353,21 @@ class BlockPool:
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+        if self._on_alloc_callbacks:
+            for block in ret:
+                for cb in self._on_alloc_callbacks:
+                    cb(block.block_id)
         return ret
+
+    def register_on_alloc_callback(self, cb: Any) -> None:
+        """Register a callback invoked for each block returned by
+        `get_new_blocks`, after the block has been removed from any prefix
+        cache hash but before the caller writes new data.
+
+        Used by the unified KV+expert page pool to clear stale expert
+        mappings on pages the scheduler reclaims for KV.
+        """
+        self._on_alloc_callbacks.append(cb)
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """

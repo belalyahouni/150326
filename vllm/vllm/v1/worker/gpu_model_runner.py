@@ -4590,10 +4590,20 @@ class GPUModelRunner(
             # Initialize expert caches for MoE layers after weights are loaded.
             # This must happen before profile_run / torch.compile tracing.
             if self.vllm_config.offload_config.expert_offload:
-                from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-                for module in self.model.modules():
-                    if isinstance(module, FusedMoE):
-                        module._maybe_init_expert_cache()
+                if self.vllm_config.offload_config.expert_unified_pool:
+                    # Unified pool: move experts to CPU, allocate staging
+                    # tensors (before determine_available_memory runs so
+                    # they're accounted as already-used GPU memory), and
+                    # mutate cache_config.block_size so the scheduler's
+                    # page size equals one expert slot.
+                    self._init_unified_pool_metadata()
+                else:
+                    from vllm.model_executor.layers.fused_moe.layer import (
+                        FusedMoE,
+                    )
+                    for module in self.model.modules():
+                        if isinstance(module, FusedMoE):
+                            module._maybe_init_expert_cache()
 
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
@@ -6437,6 +6447,12 @@ class GPUModelRunner(
             # Initialize the memory buffer for KV cache
             kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
 
+            # Unified pool needs the raw int8 byte tensors to alias as
+            # per-layer pool buffers. Save a reference before they fall out
+            # of scope.
+            if self.vllm_config.offload_config.expert_unified_pool:
+                self._kv_cache_raw_tensors = kv_cache_raw_tensors
+
             # Change the memory buffer to the desired shape
             kv_caches = self._reshape_kv_cache_tensors(
                 kv_cache_config, kv_cache_raw_tensors, kernel_block_sizes
@@ -6615,6 +6631,338 @@ class GPUModelRunner(
             self.kv_cache_config.kv_cache_groups.append(
                 KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)
             )
+
+    def _init_unified_pool_metadata(self) -> None:
+        """Pre-memory-profile setup for the unified KV+expert page pool.
+
+        Runs as part of ``load_model`` (before ``determine_available_memory``)
+        so that staging bytes are accounted as already-used GPU memory and
+        the KV-cache budget reported to the scheduler matches the baseline.
+
+        Steps:
+          1. Move every MoE layer's expert weights to CPU pinned RAM.
+          2. Validate that every MoE layer shares the same shapes/dtype and
+             num_experts (required for uniform page sizing).
+          3. Compute ``expert_slot_bytes`` (w13 + w2) and
+             ``bytes_per_token_per_layer`` from the attention KV spec; from
+             those derive ``block_size_tokens`` so that a KV block occupies
+             exactly one expert slot. Assert kernel block size divisibility.
+          4. Mutate ``cache_config.block_size`` (same in-process object as
+             EngineCore reads under UniProcExecutor).
+          5. Pre-allocate per-layer staging tensors on GPU and fill them with
+             every expert from CPU. Staging is read-only for the rest of the
+             run; the unmodified Triton kernel reads from it.
+        """
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+
+        moe_modules: list[FusedMoE] = [
+            m for m in self.model.modules() if isinstance(m, FusedMoE)
+        ]
+        if not moe_modules:
+            logger.warning(
+                "expert_unified_pool=True but no FusedMoE modules found; "
+                "unified pool will not be activated."
+            )
+            return
+
+        w13_shape: tuple[int, ...] | None = None
+        w2_shape: tuple[int, ...] | None = None
+        expert_dtype: torch.dtype | None = None
+        num_experts: int | None = None
+        per_layer: list[dict] = []
+
+        for module in moe_modules:
+            cpu_w13, cpu_w2 = module.move_experts_to_cpu()
+            layer_shape = tuple(cpu_w13.shape[1:])
+            layer_w2_shape = tuple(cpu_w2.shape[1:])
+            if w13_shape is None:
+                w13_shape = layer_shape
+                w2_shape = layer_w2_shape
+                expert_dtype = cpu_w13.dtype
+                num_experts = cpu_w13.shape[0]
+            else:
+                assert layer_shape == w13_shape, (
+                    f"Non-uniform MoE w13 shape: {layer_shape} vs {w13_shape}"
+                )
+                assert layer_w2_shape == w2_shape, (
+                    f"Non-uniform MoE w2 shape: {layer_w2_shape} vs {w2_shape}"
+                )
+                assert cpu_w13.dtype == expert_dtype, (
+                    f"Non-uniform MoE dtype: {cpu_w13.dtype} vs {expert_dtype}"
+                )
+                assert cpu_w13.shape[0] == num_experts, (
+                    f"Non-uniform num_experts: {cpu_w13.shape[0]} vs "
+                    f"{num_experts}"
+                )
+            per_layer.append(
+                {
+                    "module": module,
+                    "layer_idx": module.layer_id,
+                    "cpu_w13": cpu_w13,
+                    "cpu_w2": cpu_w2,
+                }
+            )
+
+        assert w13_shape is not None and w2_shape is not None
+        assert expert_dtype is not None and num_experts is not None
+        element_size = torch.tensor([], dtype=expert_dtype).element_size()
+        w13_bytes = 1
+        for d in w13_shape:
+            w13_bytes *= d
+        w13_bytes *= element_size
+        w2_bytes = 1
+        for d in w2_shape:
+            w2_bytes *= d
+        w2_bytes *= element_size
+        expert_slot_bytes = w13_bytes + w2_bytes
+
+        # Read num_kv_heads / head_size from a real Attention module rather
+        # than from model_config. FullAttentionSpec.page_size_bytes computes
+        # `2 * block_size * num_kv_heads * head_size_v * dtype_size` using the
+        # module's own attributes, and some models populate them differently
+        # from `model_config.get_num_kv_heads` / `get_head_size`. Using the
+        # module directly guarantees our page_bytes matches what the scheduler
+        # will later allocate per raw KV tensor.
+        from vllm.model_executor.layers.attention.attention import Attention
+        attn_modules = [m for m in self.model.modules() if isinstance(m, Attention)]
+        assert attn_modules, (
+            "Unified pool: no Attention modules found; cannot derive "
+            "bytes_per_token_per_layer."
+        )
+        ref_attn = attn_modules[0]
+        attn_num_kv_heads = ref_attn.num_kv_heads
+        attn_head_size_v = ref_attn.head_size_v
+        attn_kv_dtype = ref_attn.kv_cache_torch_dtype
+        for m in attn_modules[1:]:
+            assert m.num_kv_heads == attn_num_kv_heads, (
+                f"Non-uniform attention num_kv_heads: {m.num_kv_heads} vs "
+                f"{attn_num_kv_heads}. Unified pool requires uniform attention."
+            )
+            assert m.head_size_v == attn_head_size_v, (
+                f"Non-uniform attention head_size_v: {m.head_size_v} vs "
+                f"{attn_head_size_v}."
+            )
+            assert m.kv_cache_torch_dtype == attn_kv_dtype, (
+                f"Non-uniform attention kv dtype: {m.kv_cache_torch_dtype} vs "
+                f"{attn_kv_dtype}."
+            )
+        kv_dtype_size = torch.tensor([], dtype=attn_kv_dtype).element_size()
+        # KV block holds K+V for N tokens across one layer:
+        #   page_size_bytes = 2 * block_size * num_kv_heads * head_size_v * dtype
+        bytes_per_token_per_layer = (
+            2 * attn_num_kv_heads * attn_head_size_v * kv_dtype_size
+        )
+
+        # The page must hold both an expert slot and a whole number of KV
+        # tokens divisible by the kernel block size (commonly 16). Round the
+        # slot up to the next multiple of (16 * bytes_per_token_per_layer) to
+        # satisfy both; waste is a few hundred bytes out of ~12 MB.
+        alignment = 16 * bytes_per_token_per_layer
+        if expert_slot_bytes % alignment != 0:
+            pad = alignment - (expert_slot_bytes % alignment)
+            padded_page_bytes = expert_slot_bytes + pad
+        else:
+            padded_page_bytes = expert_slot_bytes
+        block_size_tokens = padded_page_bytes // bytes_per_token_per_layer
+        assert block_size_tokens % 16 == 0, (
+            f"block_size_tokens ({block_size_tokens}) must be divisible "
+            f"by the attention kernel block size (16)."
+        )
+
+        # Mark the block_size as user-specified so that
+        # Platform.update_block_size_for_backend (called right after
+        # load_model in UniProcExecutor) does not clobber our value back to
+        # the backend's preferred default. FLASH_ATTN reports MultipleOf(16)
+        # and 1536 % 16 == 0, so the spec/attention kernel accept this size.
+        cache_config = self.vllm_config.cache_config
+        cache_config.block_size = block_size_tokens
+        object.__setattr__(cache_config, "user_specified_block_size", True)
+
+        expert_cache_size = self.vllm_config.offload_config.expert_cache_size
+        if expert_cache_size <= 0:
+            expert_cache_size = num_experts
+
+        # Pre-allocate staging: one [num_experts, *w13_shape] + one
+        # [num_experts, *w2_shape] per MoE layer, on GPU. Filled from CPU now
+        # so this memory is "already used" when determine_available_memory
+        # runs next, keeping the scheduler pool budget equal to the baseline.
+        staging_bytes_per_layer = num_experts * expert_slot_bytes
+        total_staging_bytes = staging_bytes_per_layer * len(moe_modules)
+        logger.info(
+            "Unified pool: page_bytes=%d (w13=%d w2=%d pad=%d) "
+            "block_size_tokens=%d num_moe_layers=%d num_experts=%d "
+            "staging_overhead=%.2f GiB",
+            padded_page_bytes,
+            w13_bytes,
+            w2_bytes,
+            padded_page_bytes - expert_slot_bytes,
+            block_size_tokens,
+            len(moe_modules),
+            num_experts,
+            total_staging_bytes / (1024**3),
+        )
+
+        for entry in per_layer:
+            cpu_w13 = entry["cpu_w13"]
+            cpu_w2 = entry["cpu_w2"]
+            staging_w13 = torch.empty(
+                (num_experts, *w13_shape),
+                dtype=expert_dtype,
+                device=self.device,
+            )
+            staging_w2 = torch.empty(
+                (num_experts, *w2_shape),
+                dtype=expert_dtype,
+                device=self.device,
+            )
+            # Blocking copies to keep allocation tracking simple; this runs
+            # once at startup, not on the hot path.
+            for eid in range(num_experts):
+                staging_w13[eid].copy_(cpu_w13[eid])
+                staging_w2[eid].copy_(cpu_w2[eid])
+            entry["staging_w13"] = staging_w13
+            entry["staging_w2"] = staging_w2
+
+        self._unified_pool_metadata = {
+            "moe_modules": moe_modules,
+            "per_layer": per_layer,
+            "w13_shape": w13_shape,
+            "w2_shape": w2_shape,
+            "expert_dtype": expert_dtype,
+            "num_experts": num_experts,
+            "w13_bytes": w13_bytes,
+            "w2_bytes": w2_bytes,
+            "page_bytes": padded_page_bytes,
+            "block_size_tokens": block_size_tokens,
+            "expert_cache_size": expert_cache_size,
+        }
+        self._unified_pool_manager = None
+
+    def _setup_unified_pool_manager(self, block_pool) -> None:
+        """Build the ``UnifiedPagePoolManager`` from the scheduler's BlockPool.
+
+        Called via ``collective_rpc("setup_unified_pool", ...)`` after the
+        scheduler is constructed. By this point ``_init_unified_pool_metadata``
+        has already run and the per-layer int8 KV tensors live in
+        ``self._kv_cache_raw_tensors``.
+        """
+        meta = getattr(self, "_unified_pool_metadata", None)
+        if meta is None:
+            return
+
+        from vllm.model_executor.layers.fused_moe.unified_pool import (
+            PerLayerPool,
+            UnifiedPagePoolManager,
+        )
+
+        raw_tensors: dict[str, torch.Tensor] = getattr(
+            self, "_kv_cache_raw_tensors", {}
+        )
+        if not raw_tensors:
+            raise RuntimeError(
+                "Unified pool: _kv_cache_raw_tensors is empty. This means the "
+                "uniform-kv-cache codepath was used; unified pool requires "
+                "the general fallback path."
+            )
+
+        # Map layer_idx -> attention layer raw int8 tensor. Attention layer
+        # names share a numeric index with the MoE layer at the same depth
+        # (both derived from extract_layer_index).
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        idx_to_raw: dict[int, torch.Tensor] = {}
+        for layer_name, raw in raw_tensors.items():
+            try:
+                idx = extract_layer_index(layer_name)
+            except Exception:
+                continue
+            # If multiple attn layers at the same index (unusual), last wins.
+            idx_to_raw[idx] = raw
+
+        pools: dict[int, PerLayerPool] = {}
+        page_bytes = meta["page_bytes"]
+        for entry in meta["per_layer"]:
+            li = entry["layer_idx"]
+            raw = idx_to_raw.get(li)
+            if raw is None:
+                raise RuntimeError(
+                    f"Unified pool: no raw KV tensor for layer_idx={li}. "
+                    f"Available: {sorted(idx_to_raw.keys())}"
+                )
+            assert raw.dtype == torch.int8, (
+                f"Expected int8 raw KV tensor, got {raw.dtype}"
+            )
+            if raw.numel() % page_bytes != 0:
+                # The scheduler's BlockPool already established num_gpu_blocks
+                # from spec.page_size_bytes; if that disagrees with our
+                # page_bytes, our metadata query diverged from the spec. Surface
+                # enough context to pinpoint the mismatch.
+                raise RuntimeError(
+                    f"Unified pool: raw tensor size {raw.numel()} is not a "
+                    f"multiple of page_bytes {page_bytes} for layer_idx={li}. "
+                    f"This means our computed page size disagrees with the "
+                    f"scheduler's spec.page_size_bytes. "
+                    f"num_gpu_blocks={block_pool.num_gpu_blocks}, "
+                    f"spec-implied page_size_bytes="
+                    f"{raw.numel() // max(block_pool.num_gpu_blocks, 1)}."
+                )
+            n_pages = raw.numel() // page_bytes
+            pools[li] = PerLayerPool(
+                layer_idx=li,
+                pool_buffer=raw,
+                n_pages=n_pages,
+                page_bytes=page_bytes,
+                w13_shape=meta["w13_shape"],
+                w2_shape=meta["w2_shape"],
+                expert_dtype=meta["expert_dtype"],
+                w13_bytes=meta["w13_bytes"],
+                w2_bytes=meta["w2_bytes"],
+                cpu_w13=entry["cpu_w13"],
+                cpu_w2=entry["cpu_w2"],
+                staging_w13=entry["staging_w13"],
+                staging_w2=entry["staging_w2"],
+            )
+
+        manager = UnifiedPagePoolManager(
+            pools=pools, block_pool=block_pool, device=self.device
+        )
+        block_pool.register_on_alloc_callback(manager.on_block_allocated)
+
+        for entry in meta["per_layer"]:
+            entry["module"]._unified_pool = manager
+
+        num_gpu_blocks = block_pool.num_gpu_blocks
+        warm = meta["expert_cache_size"]
+        required = warm * len(pools)
+        if required > num_gpu_blocks - 1:  # -1 for null block
+            new_warm = max(0, (num_gpu_blocks - 1) // max(len(pools), 1))
+            logger.warning(
+                "Unified pool: requested expert_cache_size=%d across %d "
+                "layers needs %d pages but only %d are available; "
+                "reducing warm-up to %d per layer.",
+                warm,
+                len(pools),
+                required,
+                num_gpu_blocks - 1,
+                new_warm,
+            )
+            warm = new_warm
+
+        manager.warm_pool_all_layers(warm)
+        self._unified_pool_manager = manager
+        logger.info(
+            "Unified pool activated: num_pages=%d num_moe_layers=%d "
+            "warm_experts_per_layer=%d",
+            num_gpu_blocks,
+            len(pools),
+            warm,
+        )
+
+    def get_unified_pool_block_count(self) -> int | None:
+        mgr = getattr(self, "_unified_pool_manager", None)
+        if mgr is None:
+            return None
+        return mgr.block_pool.num_gpu_blocks
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
