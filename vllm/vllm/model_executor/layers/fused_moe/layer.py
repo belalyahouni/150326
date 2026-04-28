@@ -3,7 +3,7 @@
 
 from collections.abc import Callable, Iterable
 from enum import Enum
-from typing import Literal, cast, get_args, overload
+from typing import Any, Literal, cast, get_args, overload
 
 import torch
 from torch.nn.parameter import UninitializedParameter
@@ -641,6 +641,13 @@ class FusedMoE(CustomOp):
             if vllm_config.offload_config.expert_offload
             else 0
         )
+        # Unified-pool path: populated by the worker after weights are
+        # loaded (Stage 1) and again with a manager reference (Stage 2).
+        self._unified_pool = None
+        self._unified_pool_enabled = (
+            vllm_config.offload_config.expert_offload
+            and vllm_config.offload_config.expert_unified_pool
+        )
 
         # Disable shared expert overlap if:
         #   - we are using eplb with non-default backend, because of correctness issues
@@ -732,25 +739,13 @@ class FusedMoE(CustomOp):
         from vllm.model_executor.layers.fused_moe.expert_cache import (
             ExpertCache,
         )
+        from vllm.model_executor.layers.fused_moe.unified_pool import (
+            move_experts_to_cpu,
+        )
 
-        cpu_w13 = self.w13_weight.data
-        cpu_w2 = self.w2_weight.data
-        # Move to CPU if still on GPU (weights are loaded on GPU by default)
-        if cpu_w13.is_cuda:
-            cpu_w13 = cpu_w13.cpu()
-        if cpu_w2.is_cuda:
-            cpu_w2 = cpu_w2.cpu()
-        # Pin memory for async DMA transfers
-        if not cpu_w13.is_pinned():
-            cpu_w13 = cpu_w13.pin_memory()
-        if not cpu_w2.is_pinned():
-            cpu_w2 = cpu_w2.pin_memory()
-        self.w13_weight = torch.nn.Parameter(
-            cpu_w13, requires_grad=False
-        )
-        self.w2_weight = torch.nn.Parameter(
-            cpu_w2, requires_grad=False
-        )
+        cpu_w13, cpu_w2 = move_experts_to_cpu(self.w13_weight, self.w2_weight)
+        self.w13_weight = torch.nn.Parameter(cpu_w13, requires_grad=False)
+        self.w2_weight = torch.nn.Parameter(cpu_w2, requires_grad=False)
 
         device = torch.device("cuda", torch.cuda.current_device())
         cache_size = min(self._expert_cache_size, cpu_w13.shape[0])
@@ -766,6 +761,72 @@ class FusedMoE(CustomOp):
             cache_size,
             cpu_w13.shape[0],
         )
+
+    def unified_pool_stage1(self) -> dict[str, Any]:
+        """Stage-1 of unified pool init: pin experts to CPU and allocate
+        the per-layer staging tensors. Runs *before* the memory profile
+        so the profiler subtracts staging from the budget reported to
+        the scheduler.
+
+        Returns metadata describing this layer's expert slot, used by
+        the worker to derive ``block_size_tokens``.
+        """
+        from vllm.model_executor.layers.fused_moe.unified_pool import (
+            move_experts_to_cpu,
+        )
+
+        if not hasattr(self, "w13_weight") or not hasattr(self, "w2_weight"):
+            raise RuntimeError(
+                "FusedMoE has no w13_weight/w2_weight at unified-pool "
+                "Stage 1 — weights have not been loaded yet."
+            )
+        cpu_w13, cpu_w2 = move_experts_to_cpu(self.w13_weight, self.w2_weight)
+        self.w13_weight = torch.nn.Parameter(cpu_w13, requires_grad=False)
+        self.w2_weight = torch.nn.Parameter(cpu_w2, requires_grad=False)
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        staging_w13 = torch.empty(
+            cpu_w13.shape, dtype=cpu_w13.dtype, device=device
+        )
+        staging_w2 = torch.empty(
+            cpu_w2.shape, dtype=cpu_w2.dtype, device=device
+        )
+        # Fill the staging tensors with all experts. The kernel will
+        # read from them every forward (Phase 1 simulation).
+        staging_w13.copy_(cpu_w13, non_blocking=True)
+        staging_w2.copy_(cpu_w2, non_blocking=True)
+
+        self._unified_pool_staging_w13 = staging_w13
+        self._unified_pool_staging_w2 = staging_w2
+        self._unified_pool_cpu_w13 = cpu_w13
+        self._unified_pool_cpu_w2 = cpu_w2
+
+        num_experts = cpu_w13.shape[0]
+        w13_bytes_per_expert = (
+            cpu_w13.element_size() * cpu_w13[0].numel()
+        )
+        w2_bytes_per_expert = (
+            cpu_w2.element_size() * cpu_w2[0].numel()
+        )
+        return {
+            "layer_idx": self.layer_id,
+            "num_experts": num_experts,
+            "w13_dtype": cpu_w13.dtype,
+            "w2_dtype": cpu_w2.dtype,
+            "w13_bytes_per_expert": w13_bytes_per_expert,
+            "w2_bytes_per_expert": w2_bytes_per_expert,
+            "expert_slot_bytes": w13_bytes_per_expert + w2_bytes_per_expert,
+            "staging_w13_nbytes": staging_w13.numel()
+            * staging_w13.element_size(),
+            "staging_w2_nbytes": staging_w2.numel()
+            * staging_w2.element_size(),
+        }
+
+    def attach_unified_pool(self, pool) -> None:
+        """Stage-2: attach the per-layer ``UnifiedPool`` so forward
+        dispatches to ``_forward_with_unified_pool``.
+        """
+        self._unified_pool = pool
 
     @property
     def shared_experts(self) -> torch.nn.Module | None:
@@ -1565,12 +1626,67 @@ class FusedMoE(CustomOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self._unified_pool is not None:
+            return self._forward_with_unified_pool(
+                hidden_states, router_logits
+            )
         if self._expert_cache is not None:
             return self._forward_with_expert_cache(hidden_states, router_logits)
         return self.runner.forward(
             hidden_states,
             router_logits,
         )
+
+    def _forward_with_unified_pool(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass using the unified per-layer page pool.
+
+        1. Route tokens to experts and dedupe to needed expert ids.
+        2. Manager ensures them loaded — pins hits, allocates+DMAs misses.
+        3. Swap ``w13_weight``/``w2_weight`` to point at the layer's
+           static staging tensors (full width, all experts present).
+           Leave ``global_num_experts`` and ``topk_ids`` unchanged
+           (Phase 1 staging is full-width).
+        4. Run ``quant_method.apply`` inside try/finally that restores
+           the originals.
+        5. Release pinned blocks and advance the manager's step counter.
+           (The MRU bumps happen inside ``ensure_loaded`` for both hits
+           and misses; no separate ``mark_recently_used`` is needed.)
+        """
+        assert self._unified_pool is not None
+        pool = self._unified_pool
+        manager = pool.manager
+
+        topk_weights, topk_ids = self.runner.router.select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+        )
+
+        needed_expert_ids = topk_ids.unique().tolist()
+        manager.ensure_loaded(pool, needed_expert_ids)
+
+        orig_w13 = self.w13_weight.data
+        orig_w2 = self.w2_weight.data
+        try:
+            self.w13_weight.data = pool.staging_w13
+            self.w2_weight.data = pool.staging_w2
+            result = self.quant_method.apply(
+                layer=self,
+                x=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                shared_experts_input=None,
+            )
+        finally:
+            self.w13_weight.data = orig_w13
+            self.w2_weight.data = orig_w2
+
+        manager.release_pinned(pool)
+        manager.end_forward_step()
+        return result
 
     def _forward_with_expert_cache(
         self,

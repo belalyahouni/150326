@@ -146,6 +146,20 @@ class EngineCore:
             log_stats=self.log_stats,
             block_size=scheduler_block_size,
         )
+
+        if vllm_config.offload_config.expert_unified_pool:
+            from vllm.v1.executor.uniproc_executor import UniProcExecutor
+
+            assert isinstance(self.model_executor, UniProcExecutor), (
+                "--expert-unified-pool requires UniProcExecutor "
+                "(single-process). Multi-process serialization of "
+                "the BlockPool reference is not implemented in the "
+                "Phase 1 MVP."
+            )
+            block_pool = self.scheduler.kv_cache_manager.block_pool  # type: ignore[attr-defined]
+            self.model_executor.collective_rpc(
+                "setup_unified_pool", args=(block_pool,), single_value=True
+            )
         self.use_spec_decode = vllm_config.speculative_config is not None
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore

@@ -104,7 +104,21 @@ class OffloadConfig:
     """Number of MoE expert slots to cache on GPU per layer. Only used when
     expert_offload is True. When 0, all experts are cached (effectively no
     eviction). Example: for a 256-expert model, setting this to 32 keeps
-    32 expert replicas on GPU and evicts LRU experts on cache miss."""
+    32 expert replicas on GPU and evicts LRU experts on cache miss.
+
+    Under --expert-unified-pool this controls only the initial warm-pool
+    occupancy at startup; the LRU is free to grow or shrink the expert
+    footprint at runtime based on workload pressure."""
+
+    expert_unified_pool: bool = False
+    """Enable the unified per-layer page pool that shares a single GPU
+    VRAM region between cached-prefix KV blocks and expert weight pages.
+    A per-layer mixed LRU decides what to evict under memory pressure.
+    Phase 1 MVP: keeps a static staging tensor per layer so the unmodified
+    fused MoE kernel can read full-width expert weights, while a real
+    CPU->GPU DMA on miss exercises PCIe latency honestly. Requires
+    expert_offload=True, enable_prefix_caching=True, tensor_parallel_size=1,
+    pipeline_parallel_size=1."""
 
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
@@ -146,6 +160,12 @@ class OffloadConfig:
                 "Set offload_backend explicitly to suppress this warning.",
                 stacklevel=2,
             )
+
+        if self.expert_unified_pool and not self.expert_offload:
+            raise ValueError(
+                "--expert-unified-pool requires --expert-offload."
+            )
+
         return self
 
     def compute_hash(self) -> str:

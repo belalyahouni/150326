@@ -25,9 +25,13 @@ The `block_id` namespace is **global** — one numbering shared across all layer
 
 On top of this namespace, **each layer owns one LRU containing expert pages and KV blocks as peers**. The LRU ranks every evictable thing layer `L` currently holds at its offsets — `L`'s expert pages and `L`'s view of cached-prefix KV blocks. KV and expert entries compete on equal footing, ordered by `L`'s recency alone. There is no fixed expert/KV split inside a layer: the recency-driven eviction *is* the dynamic rebalance the unified pool exists to provide. Active-sequence KV is pinned by the scheduler, lives outside the LRU, and is never an eviction candidate.
 
-Cached-prefix recency is naturally **global**, not per-layer — attention reads `block_id B` at every layer in lockstep within one forward, so per-layer timestamps for prefix entries are identical. The "per-layer mixed LRU" can therefore be implemented as a per-layer expert-recency map merged at query time with one shared prefix-recency map, rather than N redundant copies of the prefix ordering.
+**"Recency" means hit recency — last time the entry was *used*, not last time it was *claimed*.** Every forward, every entry that gets touched moves to the MRU end of `L`'s LRU. For experts: every id in `topk_ids.unique()` is a hit on `L`'s expert side and bumps to MRU. For prefix KV: every block read by attention this forward is a hit on the prefix side and bumps to MRU. Eviction takes the cold tail of the *resulting* ordering. A frequently-hit-but-never-reclaimed expert must be protected by its hit count; an expert that was claimed long ago and never hit since must be evictable.
 
-When `L` misses on a new expert, `L` walks its own LRU from cold to hot and picks the coldest non-pinned entry as victim:
+This makes the bump-on-hit step **mandatory and bidirectional** (experts and prefix blocks both bump). The forward path needs two announcements per layer per step: (1) the expert ids touched (already known — `topk_ids.unique()`), and (2) the prefix block ids touched (needs a hook — attention currently doesn't surface this). Without both bumps, the LRU degenerates into "claim-recency," which ignores actual usage and is **not** what this design wants.
+
+Cached-prefix hit-recency is naturally **global**, not per-layer — attention reads `block_id B` at every layer in lockstep within one forward, so the timestamps for a given prefix entry are identical across layers. The "per-layer mixed LRU" can therefore be implemented as **a per-layer expert-recency list plus one shared prefix-recency list, merged at eviction time** to find the coldest item across both. The merge is over hit-recency lists; reusing `BlockPool.free_block_queue` as the merged ordering is **wrong** — that queue tracks claim/free events, not hit events.
+
+When `L` misses on a new expert, `L` walks its own (merged) LRU from cold to hot and picks the coldest non-pinned entry as victim:
 
 - **Victim is one of `L`'s experts.** Drop `L`'s expert map entry at that `block_id`; DMA the new expert into `L`'s slot. Other layers' state at the same `block_id` is untouched — physical bytes elsewhere don't change, mappings elsewhere stay valid.
 - **Victim is a cached-prefix KV block.** Clear the prefix hash from `FreeKVCacheBlockQueue` so future requests can't match against now-stale data, remove the corresponding entry from every layer's LRU, and DMA `L`'s new expert into `L`'s slot at that `block_id`. The drop is global by necessity — the cached prefix is a global concept (same hash at every layer), so once `L` overwrites its bytes the prefix is broken everywhere; from `L`'s perspective the prefix was the coldest thing it held, and dropping it costs the same prefix-cache miss everywhere.
@@ -95,9 +99,11 @@ The agent owns concrete data structures, function signatures, and stream/sync co
 
 ### New module — `vllm/model_executor/layers/fused_moe/unified_pool.py`
 
-A per-layer pool object holding: the aliased pool byte buffer (a view onto the layer's KV raw tensor — **do not allocate a second buffer**), the layer's mixed LRU state (expert pages + cached-prefix KV blocks), the static staging tensors, the CPU-pinned source-of-truth tensors, hit/miss counters.
+A per-layer pool object holding: the aliased pool byte buffer (a view onto the layer's KV raw tensor — **do not allocate a second buffer**), the layer's mixed LRU state (expert pages + cached-prefix KV blocks, ordered by hit recency), the static staging tensors, the CPU-pinned source-of-truth tensors, hit/miss counters.
 
-A manager that owns: the `BlockPool` reference, the cross-layer "which layers hold an expert at page P" index, the dedicated transfer stream, the on-allocation callback, per-forward pin/release bookkeeping, log-stats output. The existing `expert_cache.py` stays unchanged for the non-unified path.
+The mixed-LRU state must be **the actual datastructure consulted at eviction time**, not a vestigial side-record. Concretely, the manager keeps a per-layer ordered structure (e.g. a doubly-linked list keyed by `(kind, id)` where `kind ∈ {expert, prefix}`) plus a hash from key to node for O(1) bumps. On every hit — expert *or* prefix — the corresponding node is moved to the MRU end. On every miss the cold tail is walked to find a non-pinned victim. **Do not substitute `BlockPool.free_block_queue` for this structure**: that queue tracks claim/free events, not hit events, and using it as the LRU silently degrades the eviction policy to claim-recency. The shared global prefix-recency list referenced in §2 lives on the manager (one copy, attached to every layer's view); each layer's expert-recency list lives on the layer.
+
+A manager that owns: the `BlockPool` reference, the cross-layer "which layers hold an expert at page P" index, the shared prefix-recency list, the dedicated transfer stream, the on-allocation callback, per-forward pin/release bookkeeping, log-stats output. The existing `expert_cache.py` stays unchanged for the non-unified path.
 
 ### Config and CLI — `vllm/config/offload.py`, `vllm/engine/arg_utils.py`
 
@@ -111,12 +117,16 @@ Add an on-allocation callback list and a register method. Fan out callbacks at t
 
 Add a `_unified_pool` attribute alongside the existing `_expert_cache`. In `forward_native`, dispatch to a new `_forward_with_unified_pool` before the existing expert-cache path. The unified path:
 1. Dedupe `topk_ids` to needed expert ids (`topk_ids.unique().tolist()`).
-2. Ask the manager to ensure them loaded — pins hits, allocates+DMAs misses, applies the `wait_stream` barrier.
+2. Ask the manager to ensure them loaded — pins hits, allocates+DMAs misses, applies the `wait_stream` barrier. **Bumps every hit expert to MRU on `L`'s expert-recency list as part of "ensure loaded".** Misses also bump (the just-claimed expert is the most recently used).
 3. Swap `w13_weight.data`/`w2_weight.data` to point at the layer's static staging tensors. **Leave `global_num_experts` unchanged** (staging is full width). **Do not remap `topk_ids`** — global ids index correctly into full-width staging.
 4. Run `quant_method.apply` inside try/finally that restores the originals.
 5. Ask the manager to release pinned pages (no `cuda.synchronize()` needed).
 
-The current `_maybe_init_expert_cache` does CPU-pinning inline. Extract a `move_experts_to_cpu()` helper from those lines so the unified setup can reuse the same logic.
+The current `_maybe_init_expert_cache` does CPU-pinning inline. Extract a `move_experts_to_cpu()` helper from those lines so the unified setup can reuse the same logic. Also add an early-return guard so `_maybe_init_expert_cache` is a no-op when the unified pool is enabled — `prepare_communication_buffer_for_model` calls it before Stage 1 runs, and without the guard it allocates a useless `ExpertCache` that never gets consulted but still occupies GPU memory.
+
+### Prefix-hit bump hook — attention layer
+
+Attention currently doesn't surface "which prefix blocks did I just read." The unified pool needs that information, per layer per forward, to bump prefix entries to MRU on the shared prefix-recency list. Wire a hook from the attention forward (or the block-table indexing path) that calls `manager.note_prefix_hits(layer_idx, block_ids)` once per layer per forward. **Without this hook the LRU is missing half its bump signal** and degrades to "evict-by-claim-time" for prefix entries — the exact failure mode §7.6 calls out.
 
 ### Worker setup — `vllm/v1/worker/gpu_model_runner.py`, `vllm/v1/worker/gpu_worker.py`
 
@@ -180,4 +190,9 @@ Failure modes that are not obvious from reading the design.
 4. **Top-k vs needed-experts confusion.** `top_k=8` does not mean 8 unique experts per forward — multiple tokens routing to the same expert dedupe upstream. Hit/miss counts are over `topk_ids.unique()`, not over `top_k`. Don't treat "fewer than top-k entries in NEED" as a bug.
 
 5. **The "page → which layers hold an expert here" index is two concerns, not one.** It tracks both *membership* ("which layers currently hold an expert at page P") and *eviction driver* ("which layers must be invalidated when P is reused"). KV-driven invalidation iterates the full set; expert-driven invalidation only touches the calling layer's entry. Keep this distinction explicit at every call site.
+
+6. **Claim-recency masquerading as use-recency.** A previous attempt added a per-layer `expert_lru` `OrderedDict`, dutifully bumped it on assign/drop/use, and then never read it — eviction walked `BlockPool.free_block_queue` instead. The result is a "claim-recency" LRU: an expert claimed long ago and hit every step since looks colder than an expert just claimed and never used. This passes the §6 step 6 architectural check (no cross-layer expert evictions) and the basic correctness smoke test, but defeats the dissertation point — the LRU is supposed to track *use*, so that a workload's actual hot set survives. Three rules to keep this from coming back:
+   - **The mixed LRU is the structure consulted at eviction.** If a per-layer ordered structure exists in the code, `_select_victim_block` reads from it. If `_select_victim_block` reads from anything else (e.g. `free_block_queue`), the per-layer structure is dead code — delete it or fix the caller.
+   - **Bump on hit, both kinds.** Expert hits bump on the layer's expert-recency list inside `ensure_loaded`. Prefix hits bump on the shared prefix-recency list inside the attention hook (§5). If either bump is missing, the corresponding side degrades to claim-recency.
+   - **Sanity test.** Construct a workload where one expert is hit every forward but its block is never reclaimed, and a different expert is claimed at step 0 and never hit again. After N steps, force a miss. The cold-tail expert must be the never-hit one, not the every-step one. If the wrong one gets evicted, the LRU is claim-driven.
 

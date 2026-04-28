@@ -515,6 +515,10 @@ class Worker(WorkerBase):
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
 
+    def setup_unified_pool(self, block_pool) -> int:
+        """Stage 2 of unified-pool init. Forwarded to the runner."""
+        return self.model_runner.setup_unified_pool(block_pool)
+
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after auto-fit to GPU memory.
 

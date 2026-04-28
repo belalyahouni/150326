@@ -4591,9 +4591,12 @@ class GPUModelRunner(
             # This must happen before profile_run / torch.compile tracing.
             if self.vllm_config.offload_config.expert_offload:
                 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-                for module in self.model.modules():
-                    if isinstance(module, FusedMoE):
-                        module._maybe_init_expert_cache()
+                if self.vllm_config.offload_config.expert_unified_pool:
+                    self._unified_pool_stage1()
+                else:
+                    for module in self.model.modules():
+                        if isinstance(module, FusedMoE):
+                            module._maybe_init_expert_cache()
 
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
@@ -6261,6 +6264,8 @@ class GPUModelRunner(
         assert layer_names == set(kv_cache_raw_tensors.keys()), (
             "Some layers are not correctly initialized"
         )
+        if self.vllm_config.offload_config.expert_unified_pool:
+            self._unified_pool_capture_raw_kv(kv_cache_raw_tensors)
         return kv_cache_raw_tensors
 
     def _attn_group_iterator(self) -> Iterator[AttentionGroup]:
@@ -6544,6 +6549,296 @@ class GPUModelRunner(
             if isinstance(group.kv_cache_spec, AttentionSpec):
                 return gid
         return 0
+
+    # ------------------------------------------------------------------
+    # Unified-pool MVP setup (two stages)
+    # ------------------------------------------------------------------
+
+    def _unified_pool_stage1(self) -> None:
+        """Stage 1 of unified-pool init.
+
+        Runs before the memory profile and KV-cache allocation:
+        - For each ``FusedMoE`` module: pin experts to CPU and allocate
+          per-layer staging tensors on GPU. The staging is allocated
+          here so the profiler subtracts it from the budget reported
+          to the scheduler (per plan §3).
+        - Derive ``block_size_tokens`` so a KV page exactly equals one
+          expert slot's bytes. Mutate ``cache_config.block_size``.
+        """
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+
+        # Validate constraints up front.
+        parallel_config = self.vllm_config.parallel_config
+        if parallel_config.tensor_parallel_size != 1:
+            raise ValueError(
+                "--expert-unified-pool requires --tensor-parallel-size=1 "
+                "(got %d). Multi-rank coordination is not implemented in "
+                "the Phase 1 MVP." % parallel_config.tensor_parallel_size
+            )
+        if parallel_config.pipeline_parallel_size != 1:
+            raise ValueError(
+                "--expert-unified-pool requires "
+                "--pipeline-parallel-size=1 "
+                "(got %d). Multi-rank coordination is not implemented in "
+                "the Phase 1 MVP." % parallel_config.pipeline_parallel_size
+            )
+        if not self.cache_config.enable_prefix_caching:
+            raise ValueError(
+                "--expert-unified-pool requires --enable-prefix-caching."
+            )
+        if not self.model_config.enforce_eager:
+            raise ValueError(
+                "--expert-unified-pool requires --enforce-eager. "
+                "Cache misses trigger variable-length DMAs that cannot "
+                "be captured in a CUDA graph."
+            )
+        if self.scheduler_config.max_num_batched_tokens != 1:
+            raise ValueError(
+                "--expert-unified-pool requires --max-num-batched-tokens=1 "
+                "in the Phase 1 MVP (got %d). A long prefill batch can "
+                "exhaust pool pages mid-call."
+                % self.scheduler_config.max_num_batched_tokens
+            )
+
+        moe_metas: list[dict[str, Any]] = []
+        moe_modules: list[FusedMoE] = []
+        for module in self.model.modules():
+            if isinstance(module, FusedMoE):
+                moe_modules.append(module)
+                moe_metas.append(module.unified_pool_stage1())
+
+        if not moe_modules:
+            raise ValueError(
+                "--expert-unified-pool was set, but the model has no "
+                "FusedMoE modules."
+            )
+
+        # All MoE layers must have the same expert slot size for the
+        # alias to work (single uniform page size across layers).
+        first = moe_metas[0]
+        for meta in moe_metas[1:]:
+            if meta["expert_slot_bytes"] != first["expert_slot_bytes"]:
+                raise ValueError(
+                    "All FusedMoE layers must have identical expert-slot "
+                    "byte sizes for the unified pool. Got %d vs %d."
+                    % (meta["expert_slot_bytes"], first["expert_slot_bytes"])
+                )
+
+        # Derive block_size_tokens from the first attention layer's spec.
+        kv_specs = self.get_kv_cache_spec()
+        if not kv_specs:
+            raise ValueError(
+                "--expert-unified-pool: model has no KV cache layers."
+            )
+        sample_spec = next(iter(kv_specs.values()))
+        if not isinstance(sample_spec, AttentionSpec):
+            raise ValueError(
+                "--expert-unified-pool: only models with AttentionSpec KV "
+                "cache layers are supported (got %s)." % type(sample_spec)
+            )
+        # Phase 1 MVP requires uniform attention-only KV cache.
+        for layer_name, spec in kv_specs.items():
+            if not isinstance(spec, AttentionSpec):
+                raise ValueError(
+                    "--expert-unified-pool requires uniform attention KV "
+                    "cache (layer %s has %s)."
+                    % (layer_name, type(spec))
+                )
+            if type(spec) is not type(sample_spec):
+                raise ValueError(
+                    "--expert-unified-pool requires uniform KV cache "
+                    "specs across layers (got %s and %s)."
+                    % (type(spec), type(sample_spec))
+                )
+
+        bytes_per_token = (
+            2  # K and V
+            * sample_spec.num_kv_heads
+            * sample_spec.head_size
+            * get_dtype_size(sample_spec.dtype)
+        )
+        expert_slot_bytes = first["expert_slot_bytes"]
+        if expert_slot_bytes % bytes_per_token != 0:
+            raise ValueError(
+                "--expert-unified-pool: expert slot size (%d B) is not "
+                "a multiple of KV bytes-per-token (%d B). The Phase 1 "
+                "MVP cannot align pages without padding."
+                % (expert_slot_bytes, bytes_per_token)
+            )
+        block_size_tokens = expert_slot_bytes // bytes_per_token
+        kernel_block_size = 16
+        if block_size_tokens % kernel_block_size != 0:
+            raise ValueError(
+                "--expert-unified-pool: derived block_size_tokens=%d is "
+                "not a multiple of kernel block size %d. "
+                "(expert_slot_bytes=%d, bytes_per_token=%d)"
+                % (
+                    block_size_tokens,
+                    kernel_block_size,
+                    expert_slot_bytes,
+                    bytes_per_token,
+                )
+            )
+
+        old_block_size = self.cache_config.block_size
+        self.cache_config.block_size = block_size_tokens
+        # Re-cache on the runner so downstream code uses the new size.
+        self.block_size = block_size_tokens
+        # Mark as user-specified so downstream auto-tuning doesn't
+        # override it (e.g. update_block_size_for_backend).
+        self.cache_config.user_specified_block_size = True
+
+        total_staging_bytes = sum(
+            meta["staging_w13_nbytes"] + meta["staging_w2_nbytes"]
+            for meta in moe_metas
+        )
+        logger.info(
+            "UnifiedPool Stage 1: %d MoE layers, expert_slot=%d B, "
+            "bytes/token=%d, block_size: %s -> %d tokens, "
+            "staging overhead=%.3f GiB",
+            len(moe_modules),
+            expert_slot_bytes,
+            bytes_per_token,
+            old_block_size,
+            block_size_tokens,
+            total_staging_bytes / (1024**3),
+        )
+
+        self._unified_pool_moe_modules = moe_modules
+        self._unified_pool_metas = moe_metas
+        self._unified_pool_expert_slot_bytes = expert_slot_bytes
+        self._unified_pool_w13_bytes = first["w13_bytes_per_expert"]
+        self._unified_pool_w2_bytes = first["w2_bytes_per_expert"]
+        self._unified_pool_manager = None
+        self._unified_pool_kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+
+    def _unified_pool_capture_raw_kv(
+        self, kv_cache_raw_tensors: dict[str, torch.Tensor]
+    ) -> None:
+        """Stage 2 helper: snapshot raw KV byte tensors after they are
+        allocated by ``_allocate_kv_cache_tensors``. Called from
+        ``initialize_kv_cache_tensors``.
+        """
+        self._unified_pool_kv_cache_raw_tensors = dict(kv_cache_raw_tensors)
+
+    def setup_unified_pool(self, block_pool) -> int:
+        """Stage 2 of unified-pool init (RPC entry point).
+
+        Construct per-layer ``UnifiedPool`` objects aliasing each
+        layer's KV byte tensor as the pool buffer, register the
+        cross-layer KV-allocation callback on ``BlockPool``, and warm
+        the first ``expert_cache_size`` experts per layer.
+
+        Returns the number of GPU blocks the pool sees (after the
+        BlockPool's reserved null block).
+        """
+        from vllm.model_executor.layers.attention_layer_base import (
+            AttentionLayerBase,
+        )
+        from vllm.model_executor.layers.fused_moe.unified_pool import (
+            UnifiedPool,
+            UnifiedPoolManager,
+        )
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        if not getattr(self, "_unified_pool_moe_modules", None):
+            raise RuntimeError(
+                "setup_unified_pool called before Stage 1 ran."
+            )
+        if not self._unified_pool_kv_cache_raw_tensors:
+            raise RuntimeError(
+                "setup_unified_pool called before KV cache tensors "
+                "were allocated."
+            )
+
+        # Build attention-layer-index → KV byte tensor map.
+        attn_layers: dict[int, torch.Tensor] = {}
+        for layer_name, attn_module in (
+            self.compilation_config.static_forward_context.items()
+        ):
+            if not isinstance(attn_module, AttentionLayerBase):
+                continue
+            if layer_name not in self._unified_pool_kv_cache_raw_tensors:
+                continue
+            layer_idx = extract_layer_index(layer_name)
+            raw = self._unified_pool_kv_cache_raw_tensors[layer_name]
+            assert raw.dtype == torch.int8, (
+                f"Expected raw KV tensor with dtype int8, got "
+                f"{raw.dtype} for {layer_name}"
+            )
+            attn_layers[layer_idx] = raw.view(-1)
+
+        manager = UnifiedPoolManager(block_pool=block_pool, device=self.device)
+
+        page_size_bytes = self._unified_pool_expert_slot_bytes
+        for moe_module, meta in zip(
+            self._unified_pool_moe_modules, self._unified_pool_metas
+        ):
+            layer_idx = meta["layer_idx"]
+            if layer_idx not in attn_layers:
+                raise RuntimeError(
+                    f"UnifiedPool: no attention KV tensor found for "
+                    f"FusedMoE at layer index {layer_idx}. Layers with "
+                    f"KV: {sorted(attn_layers)}"
+                )
+            raw_kv = attn_layers[layer_idx]
+            # vLLM sizes the per-layer KV tensor to its share of the
+            # available KV memory budget, which is not necessarily a
+            # multiple of the (unified-pool-derived) page size. Block
+            # ids only address the first ``num_gpu_blocks`` pages of
+            # this tensor anyway — slack at the end is unaddressed in
+            # the baseline too. Slice to the addressable region so the
+            # alias is exactly the byte range vLLM uses for KV.
+            required_bytes = block_pool.num_gpu_blocks * page_size_bytes
+            if raw_kv.numel() < required_bytes:
+                raise RuntimeError(
+                    f"L{layer_idx}: KV byte tensor size {raw_kv.numel()} "
+                    f"< num_gpu_blocks ({block_pool.num_gpu_blocks}) * "
+                    f"page_size_bytes ({page_size_bytes}) = {required_bytes}"
+                )
+            pool_buffer = raw_kv.narrow(0, 0, required_bytes)
+            pool = UnifiedPool(
+                layer_idx=layer_idx,
+                num_experts=meta["num_experts"],
+                staging_w13=moe_module._unified_pool_staging_w13,
+                staging_w2=moe_module._unified_pool_staging_w2,
+                cpu_w13=moe_module._unified_pool_cpu_w13,
+                cpu_w2=moe_module._unified_pool_cpu_w2,
+                pool_buffer=pool_buffer,
+                page_size_bytes=page_size_bytes,
+                w13_bytes=self._unified_pool_w13_bytes,
+                w2_bytes=self._unified_pool_w2_bytes,
+            )
+            pool.manager = manager  # back-reference for forward path
+            manager.register_layer(pool)
+            moe_module.attach_unified_pool(pool)
+
+        # Warm the cache.
+        warm_count = self.vllm_config.offload_config.expert_cache_size
+        num_moe_layers = len(self._unified_pool_moe_modules)
+        # BlockPool's null block at index 0 is permanently held — exclude
+        # it from the budget.
+        num_blocks_available = block_pool.num_gpu_blocks - 1
+        if warm_count * num_moe_layers > num_blocks_available:
+            raise RuntimeError(
+                f"UnifiedPool: warm-up requires "
+                f"{warm_count} experts × {num_moe_layers} layers = "
+                f"{warm_count * num_moe_layers} blocks, but only "
+                f"{num_blocks_available} GPU blocks are available "
+                f"(num_gpu_blocks={block_pool.num_gpu_blocks}, minus "
+                f"null block). Reduce --expert-cache-size or increase "
+                "memory budget."
+            )
+        manager.warm_up(warm_count)
+        self._unified_pool_manager = manager
+        logger.info(
+            "UnifiedPool Stage 2 complete: %d layers, warm_count=%d, "
+            "num_gpu_blocks=%d",
+            num_moe_layers,
+            warm_count,
+            block_pool.num_gpu_blocks,
+        )
+        return block_pool.num_gpu_blocks
 
     def init_routed_experts_capturer(self):
         logger.info(
