@@ -6817,17 +6817,17 @@ class GPUModelRunner(
         warm_count = self.vllm_config.offload_config.expert_cache_size
         num_moe_layers = len(self._unified_pool_moe_modules)
         # BlockPool's null block at index 0 is permanently held — exclude
-        # it from the budget.
+        # it from the budget. Warm-up shares one block_id across all
+        # layers per expert, so it consumes ``warm_count`` block_ids
+        # total, not ``warm_count × num_layers``.
         num_blocks_available = block_pool.num_gpu_blocks - 1
-        if warm_count * num_moe_layers > num_blocks_available:
+        if warm_count > num_blocks_available:
             raise RuntimeError(
-                f"UnifiedPool: warm-up requires "
-                f"{warm_count} experts × {num_moe_layers} layers = "
-                f"{warm_count * num_moe_layers} blocks, but only "
-                f"{num_blocks_available} GPU blocks are available "
-                f"(num_gpu_blocks={block_pool.num_gpu_blocks}, minus "
-                f"null block). Reduce --expert-cache-size or increase "
-                "memory budget."
+                f"UnifiedPool: warm-up requires {warm_count} blocks "
+                f"but only {num_blocks_available} GPU blocks are "
+                f"available (num_gpu_blocks="
+                f"{block_pool.num_gpu_blocks}, minus null block). "
+                f"Reduce --expert-cache-size or increase memory budget."
             )
         manager.warm_up(warm_count)
         self._unified_pool_manager = manager

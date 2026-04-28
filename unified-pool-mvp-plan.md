@@ -1,8 +1,8 @@
 # Unified Per-Layer Page Pool — MVP Plan
 
 > **Scope: Phase 1 only.** This plan covers the unified-pool MVP that proves the LRU dynamics on benchmarks. Phase 2 (modifying the Triton `fused_moe_kernel` to read expert weights directly from pool pages, eliminating the staging tensor) is **not in scope** and is not a follow-up the agent should attempt or stub for. See §3 for the Phase 1 vs Phase 2 distinction and §4 for the explicit out-of-scope list.
->
-> Starting point: `origin/main`, which already has working `--expert-offload` / `--expert-cache-size`. Implement on a fresh branch off `origin/main`. Sync edits into the venv (`venv/lib/python3.12/site-packages/vllm/...`) after every change — `vllm` is installed as a regular package, not `-e`. The agent should design data structures, function signatures, and sync code itself; this plan describes intent and constraints, not implementation.
+>Starting point: `origin/main`, which alr
+> eady has working `--expert-offload` / `--expert-cache-size`. Implement on a fresh branch off `origin/main`. Sync edits into the venv (`venv/lib/python3.12/site-packages/vllm/...`) after every change — `vllm` is installed as a regular package, not `-e`. The agent should design data structures, function signatures, and sync code itself; this plan describes intent and constraints, not implementation.
 
 ---
 
@@ -21,7 +21,7 @@ In both cases the comparison is **unified-pool-with-arbitrary-initial-split vs. 
 
 ## 2. Core Mechanic — One Mixed LRU Per Layer Over a Shared Page Namespace
 
-The `block_id` namespace is **global** — one numbering shared across all layers, locked in by vLLM's single block table. The physical buffers it indexes into are **per-layer**: a `block_id` is a logical lease pointing at the same offset in every layer's pool buffer. KV writes are synced — a `block_id` allocated to active KV commits the same logical token's bytes at that offset in every layer at once. Expert writes are independent — an expert DMA at layer `L`'s `block_id 47` touches only `L`'s offset 47.
+The `block_id` namespace is **global** — one numbering shared across all layers, locked in by vLLM's single block table. The physical buffers it indexes into are **per-layer**: a `block_id` is a logical lease pointing at the same offset in every layer's pool buffer. KV writes are synced — a `block_id` allocated to active KV commits the same logical token's bytes at that offset in every layer at once. Expert writes are independent — an expert DMA at layer `L`'s `block_id 47` touches only `L`'s offset 47. Warm-up exploits this asymmetry: a single `block_id` can hold a different expert's bytes in every layer simultaneously, so seeding `expert_cache_size` experts per layer only consumes `expert_cache_size` ids of the global namespace (see §5 Stage 2).
 
 On top of this namespace, **each layer owns one LRU containing expert pages and KV blocks as peers**. The LRU ranks every evictable thing layer `L` currently holds at its offsets — `L`'s expert pages and `L`'s view of cached-prefix KV blocks. KV and expert entries compete on equal footing, ordered by `L`'s recency alone. There is no fixed expert/KV split inside a layer: the recency-driven eviction *is* the dynamic rebalance the unified pool exists to provide. Active-sequence KV is pinned by the scheduler, lives outside the LRU, and is never an eviction candidate.
 
@@ -142,8 +142,9 @@ Branch the existing post-load expert-offload hook: when `expert_unified_pool` is
 - The engine hands the worker the scheduler's `BlockPool` via a new collective RPC.
 - Construct per-layer pool objects, aliasing each layer's KV byte tensor as the pool buffer (no new allocation).
 - Wire the manager into each `FusedMoE` module, register the cross-layer callback on `BlockPool`.
-- Warm the first `expert_cache_size` experts per layer **in the pool** (not staging — staging already has every expert; this is for LRU residency tracking and realistic startup bytes).
-- Assert `expert_cache_size * num_moe_layers <= num_gpu_blocks - 1` (account for `BlockPool`'s null block at index 0). If it fails, **abort with a clear error** — do not silently shrink.
+- Warm the first `expert_cache_size` experts per layer **in the pool** (not staging — staging already has every expert; this is for LRU residency tracking and realistic startup bytes). Warm-up exploits the per-layer-buffer / shared-id design from §2: pick one `block_id` per warmed expert, then DMA expert `e` into that *same* `block_id`'s slot in **every** layer. Total `block_id`s consumed is `expert_cache_size`, **not** `expert_cache_size × num_moe_layers` — there's no benefit to giving each layer disjoint ids at warm-up time, and burning N× the namespace just shrinks the KV side of the unified pool for no reason.
+- Assert `expert_cache_size <= num_gpu_blocks - 1` (account for `BlockPool`'s null block at index 0). If it fails, **abort with a clear error** — do not silently shrink. The minimum viable `--num-gpu-blocks-override` is therefore `expert_cache_size + 1`, regardless of layer count.
+- Trade-off this creates: every warmed `block_id` is held by all `num_moe_layers` layers simultaneously, so if KV-allocation later claims one of those ids the kv-broadcast invalidates all layers' expert mappings at that id at once. This is acceptable — warm-up is just startup seeding, the LRU reshapes from there — and is the price paid for the smaller pool floor.
 
 Expose two thin RPC passthroughs on the worker (`setup_unified_pool`, `get_unified_pool_block_count`) for engine-side dispatch.
 
@@ -185,7 +186,7 @@ Failure modes that are not obvious from reading the design.
 
 2. **Trace captured post-mutation state.** `expert_to_page` was read at the *end* of the load function, after misses had inserted their entries; the displayed `CACHE` then included pages that had just been assigned. The hit/miss self-consistency check would have flagged this. Capture all trace snapshots *before* mutating state, not after.
 
-3. **Warm-up under-sized.** With small `--num-gpu-blocks-override`, requesting `expert_cache_size × num_moe_layers` warm-up pages can exceed the pool. Earlier-warmed pages get popped to satisfy later warm-up calls and every layer ends up empty before serving starts. Assert and abort, don't silently shrink.
+3. **Warm-up under-sized.** Earlier iteration consumed disjoint `block_id`s per layer at warm-up — `expert_cache_size × num_moe_layers` total — so with small `--num-gpu-blocks-override` the warm-up walk would pop earlier-warmed pages to satisfy later layers, leaving every layer empty before serving started. Worse, the floor on `--num-gpu-blocks-override` was `cache_size × num_moe_layers + 1` (e.g. `8 × 16 + 1 = 129`) which made KV-hot scenarios impossible to set up cleanly. The fix (now in §5 Stage 2): share one `block_id` across all layers per warmed expert, dropping the floor to `expert_cache_size + 1`. The trade-off is documented in §5; the rule remains *assert and abort, don't silently shrink.*
 
 4. **Top-k vs needed-experts confusion.** `top_k=8` does not mean 8 unique experts per forward — multiple tokens routing to the same expert dedupe upstream. Hit/miss counts are over `topk_ids.unique()`, not over `top_k`. Don't treat "fewer than top-k entries in NEED" as a bug.
 
