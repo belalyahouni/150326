@@ -93,6 +93,7 @@ This mirrors `_forward_with_expert_cache` (on `main`) one-to-one, with two subst
 Same structure as Phase 1, with two adjustments:
 
 - **New flag check**: rejects `async_scheduling=True`. The default in vLLM is auto-on; users must pass `--no-async-scheduling`. Rationale: the Phase 2 pinning contract requires scheduler KV-allocation and worker forward to be strictly serialized.
+- **New backend check**: asserts the resolved attention backend's `get_kv_cache_shape` starts with `num_blocks`, not `2` — i.e., per-block K+V are contiguous in memory. Pass `--attention-backend TRITON_ATTN` at launch; the platform default `FLASH_ATTN` (`(2, num_blocks, ...)` layout) silently corrupts attention reads because pool pages no longer line up with scheduler blocks. Fail-loud if violated.
 - **Staging-overhead log line removed**. Stage 1 message becomes a single line noting "No staging tensor — kernel reads pool buffer directly."
 
 `FusedMoE.unified_pool_stage1` no longer allocates `staging_w13` / `staging_w2`. It still pins experts to CPU and stashes `_unified_pool_cpu_w13` / `_unified_pool_cpu_w2` for Stage 2.
@@ -140,7 +141,7 @@ Tracking against Phase 2 plan §7:
 | 7. Pinning regression test | pending |
 | 8. Memory accounting | pending |
 
-The `--no-async-scheduling` flag must be passed at startup. With it, Phase 2 boots; without it, Stage 1 fails fast with a descriptive ValueError.
+The `--no-async-scheduling` and `--attention-backend TRITON_ATTN` flags must both be passed at startup. Without `--no-async-scheduling`, Stage 1 fails fast. Without the Triton attention backend, the per-block K+V-contiguous layout assertion (Stage 1) fails fast — the platform's default FlashAttn layout silently corrupts attention reads via the unified pool's page aliasing.
 
 ---
 

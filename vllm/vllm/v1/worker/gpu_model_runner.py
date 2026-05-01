@@ -6554,6 +6554,48 @@ class GPUModelRunner(
     # Unified-pool MVP setup (two stages)
     # ------------------------------------------------------------------
 
+    def _assert_attention_backend_kv_layout(self) -> None:
+        # The pool aliases each layer's KV byte tensor and treats the
+        # linear view as num_gpu_blocks contiguous pages of
+        # page_size_bytes. That math only matches reality when each
+        # logical block's K and V are contiguous in memory — i.e. the
+        # backend's KV cache shape is (num_blocks, 2, ...). FlashAttn
+        # uses (2, num_blocks, ...) which puts all K's first then all
+        # V's; pool page b then physically straddles K bytes for two
+        # unrelated scheduler blocks and expert DMAs corrupt live KV.
+        # In Phase 2 the corruption is silent (kernel reads pool
+        # pages directly), so fail fast at startup.
+        from vllm.model_executor.layers.attention_layer_base import (
+            AttentionLayerBase,
+        )
+
+        sentinel_num_blocks = 99
+        for layer_name, layer in (
+            self.compilation_config.static_forward_context.items()
+        ):
+            if not isinstance(layer, AttentionLayerBase):
+                continue
+            backend = layer.get_attn_backend()
+            shape = backend.get_kv_cache_shape(
+                num_blocks=sentinel_num_blocks,
+                block_size=16,
+                num_kv_heads=1,
+                head_size=1,
+            )
+            if shape[0] != sentinel_num_blocks:
+                raise ValueError(
+                    f"--expert-unified-pool requires an attention backend "
+                    f"with K and V contiguous per block (KV cache shape "
+                    f"(num_blocks, 2, ...)). Resolved backend "
+                    f"{backend.__name__} for layer {layer_name!r} returns "
+                    f"shape {shape} (starts with 2 → K and V are split "
+                    f"regions). Pool page aliasing would land on K bytes "
+                    f"for unrelated scheduler blocks and silently corrupt "
+                    f"attention reads. Pass "
+                    f"--attention-backend TRITON_ATTN."
+                )
+            break  # one layer is enough; all attention groups share a backend
+
     def _unified_pool_stage1(self) -> None:
         """Stage 1 of unified-pool init.
 
@@ -6614,6 +6656,7 @@ class GPUModelRunner(
                 "concurrent scheduler KV-allocation breaks the pinning "
                 "contract."
             )
+        self._assert_attention_backend_kv_layout()
 
         moe_metas: list[dict[str, Any]] = []
         moe_modules: list[FusedMoE] = []

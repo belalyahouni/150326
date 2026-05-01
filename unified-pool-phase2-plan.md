@@ -148,11 +148,13 @@ Stage 1's "staging overhead" log line is removed (there is no staging overhead).
 
 Stage 2 (`setup_unified_pool`) unchanged in structure: still constructs `UnifiedPool` per layer, narrows the KV byte tensor as before. The two strided views and the `block_id_at` tensor are built inside the `UnifiedPool` constructor.
 
-### Required flags (unchanged)
+### Required flags
 
-`--expert-offload --expert-unified-pool --enable-prefix-caching --enforce-eager --max-num-batched-tokens 1`, TP=1, PP=1.
+`--expert-offload --expert-unified-pool --enable-prefix-caching --enforce-eager --max-num-batched-tokens 1 --attention-backend TRITON_ATTN`, TP=1, PP=1.
 
 The `--max-num-batched-tokens 1` justification (cap unique experts per forward at `top_k` to avoid pool exhaustion) is unchanged.
+
+**`--attention-backend TRITON_ATTN` is new and load-bearing.** The pool aliases each layer's KV byte tensor and treats the linear view as `num_gpu_blocks` contiguous pages of `page_size_bytes`. Triton's `(num_blocks, 2, block_size, num_kv_heads, head_size)` layout puts each block's K and V next to each other in memory, so pool page `b` exactly equals scheduler block `b`'s K+V bytes. FlashAttention's `(2, num_blocks, ...)` layout puts all K's first then all V's — pool page `b` then physically straddles K bytes for two unrelated scheduler blocks, expert DMAs corrupt live K cache, and attention reads garbage. The platform default on sm_8x is `FLASH_ATTN`, so this must be overridden explicitly. **In Phase 2 the corruption is silent** (the kernel reads pool pages directly, so wrong bytes look like wrong-but-plausible weights instead of an alignment crash). Stage 1 must assert the resolved attention backend's `get_kv_cache_shape` starts with `num_blocks`, not `2`, and fail loudly otherwise.
 
 ### Kernel-side considerations (unchanged but worth verifying)
 
@@ -230,4 +232,5 @@ Same as MVP plan §4, with no additions:
 | `as_strided` storage_offset interaction with `view`'d byte buffer breaks aliasing | Low | High (silent wrong reads) | Verify with a unit test that `pool_w13_view[block_id]` retrieves the same bytes as `pool_buffer.narrow(0, block_id*page_size_bytes, w13_bytes).view(bf16).reshape(w13_shape)`. |
 | `naive_block_assignment` heuristic flips to non-naive mode if the inequality changes (e.g. `top_k` increases) and `sorted_token_ids`'s structure assumes `expert_ids` indexes into a "true" `[E, N, K]` tensor | Low | Medium | The non-naive path also uses `off_experts * stride_be` — same trick works. Verify in the verification step 6 trace under both paths. |
 | Pinning bug surfaces only under load → silent corruption | Medium | High | Verification step 7. Add an assert in `_forward_with_unified_pool` that every block in `remapped_ids` is currently in `pool.pinned_blocks` (paranoid mode, env-gated). |
+| User omits `--attention-backend TRITON_ATTN`, platform picks FlashAttn → silent corruption from K/V layout mismatch (§5) | Medium | High | Stage 1 backend assertion (see §5). Failure mode was discovered empirically in Phase 1 — gibberish output with the same launch command. |
 | `block_id_at` GPU updates create implicit synchronization cost | Low | Low | Single-element writes are cheap; if profiling shows overhead, batch updates inside `ensure_loaded`. |
