@@ -5,17 +5,19 @@
 This implementation lives across 8 files in `vllm/vllm/`. One new module (`unified_pool.py`), 7 modified files.
 
 ```
-vllm/vllm/config/offload.py                              +22 / -3
-vllm/vllm/engine/arg_utils.py                            +5
-vllm/vllm/model_executor/layers/fused_moe/unified_pool.py +587 (new)
-vllm/vllm/model_executor/layers/fused_moe/layer.py       +143 / -11
-vllm/vllm/v1/core/block_pool.py                          +106 / -4
-vllm/vllm/v1/engine/core.py                              +14
-vllm/vllm/v1/worker/gpu_model_runner.py                  +301
-vllm/vllm/v1/worker/gpu_worker.py                        +4
+vllm/vllm/config/offload.py                              ~185 lines total (config + validator added)
+vllm/vllm/engine/arg_utils.py                            +3 hook lines (field, CLI arg, kwarg pass-through)
+vllm/vllm/model_executor/layers/fused_moe/unified_pool.py 712 lines (new)
+vllm/vllm/model_executor/layers/fused_moe/layer.py       1836 lines total
+vllm/vllm/v1/core/block_pool.py                          612 lines total
+vllm/vllm/v1/engine/core.py                              +13 lines (Stage-2 RPC dispatch)
+vllm/vllm/v1/worker/gpu_model_runner.py                  ~285 lines added (Stage 1, Stage 2, raw-KV capture)
+vllm/vllm/v1/worker/gpu_worker.py                        +3 lines (RPC passthrough)
 ```
 
-vLLM is installed as a regular (non-`-e`) package. Every edit must be mirrored to `venv/lib/python3.12/site-packages/vllm/...` for the running server to see it.
+vLLM is installed as a regular (non-`-e`) package. Every edit must be mirrored to `venv/lib/python3.12/site-packages/vllm/...` for the running server to see it. (As of 2026-05-01 the venv is in sync with `vllm/vllm/...`; verify with `diff -q` before re-syncing.)
+
+Line numbers cited below were accurate at write-time; later edits (notably trace-logging additions in `unified_pool.py`) have caused drift. Treat them as orientation hints, not guarantees — search for the symbol if a number looks off.
 
 ---
 
@@ -62,13 +64,13 @@ Three lines: register the field default, add the CLI argument, and forward the v
 
 ### 2.3 `model_executor/layers/fused_moe/unified_pool.py` (new)
 
-The data plane. 587 lines, organized into:
+The data plane. 712 lines, organized into:
 
 **Module-level helpers** (lines 24-47):
-- `_trace_enabled()` — reads `VLLM_UNIFIED_POOL_TRACE`. Toggles per-forward `CACHE`/`NEED`/`RESULT`/`EVICT` lines for the §6.6 architectural acceptance test.
+- `_trace_enabled()` — reads `VLLM_UNIFIED_POOL_TRACE`. Toggles the per-forward `CACHE`/`EXPERT_LRU`/`PREFIX_LRU`/`REQUEST`/`CLAIM`/`RESULT`/`EVICT` lines (and the `PREFIX_ADDED`/`PREFIX_REMOVED` callback lines) used by the §6.6 architectural acceptance test. See §8 for the full format.
 - `move_experts_to_cpu()` — extracts the CPU-pin logic that used to live inline in `_maybe_init_expert_cache`. Reused by both the plain expert-cache path and the unified Stage 1.
 
-**`UnifiedPool`** (class, lines 50-153) — per-layer state. Fields:
+**`UnifiedPool`** (class, ~lines 50-153) — per-layer state. Fields:
 - `staging_w13`, `staging_w2` — full-width GPU tensors `[num_experts, …]`, filled once at startup. The unmodified Triton kernel reads these every forward (Phase 1 simulation).
 - `cpu_w13`, `cpu_w2` — CPU-pinned source-of-truth, DMA source on miss.
 - `pool_buffer` — flat int8 view, narrowed to `num_gpu_blocks × page_size_bytes`, aliased onto the layer's KV byte tensor (no separate allocation).
@@ -76,31 +78,32 @@ The data plane. 587 lines, organized into:
 - `expert_lru: OrderedDict[int, int]` — *the* per-layer expert-recency structure consulted at eviction time. Bumped on every hit and miss.
 - `pinned_blocks: set[int]` — blocks held off the eviction-candidate list for the duration of one forward.
 - `hits`, `misses`, `forward_count` — stats.
+- `manager` — back-reference to the owning `UnifiedPoolManager`. **Set externally by `setup_unified_pool` after construction** (gpu_model_runner.py: `pool.manager = manager`); not a constructor argument. Used by `_forward_with_unified_pool` to call `manager.ensure_loaded` / `release_pinned` / `end_forward_step` without threading the manager through every call site.
 
 Key methods:
 - `assign(block_id, expert_id, step)` — install a new mapping, MRU on `expert_lru`. Asserts both directions of the mapping were free.
 - `drop(block_id) → expert_id | None` — remove the mapping.
 - `bump_expert(expert_id, step)` — `move_to_end` on the LRU. Called for hits *and* misses inside `ensure_loaded`.
 
-**`UnifiedPoolManager`** (class, lines 156-587) — cross-layer state.
+**`UnifiedPoolManager`** (class, ~lines 156-712) — cross-layer state.
 
 Constructor (lines 175-195):
 - Asserts the passed-in object is a `BlockPool`.
 - Initializes `layers: dict[int, UnifiedPool]`, `block_holder: dict[int, set[int]]` (cross-layer "which layers hold an expert at this block"), `transfer_stream` (a dedicated `torch.cuda.Stream` for DMAs), `step`, and the shared `prefix_lru: OrderedDict[int, int]`.
 - Registers three callbacks on the BlockPool: `_on_kv_allocation`, `_on_prefix_added`, `_on_prefix_removed`.
 
-Mapping helpers (lines 207-276) — `_add_holder`, `_remove_holder`, `_drop_layer_mapping`, `_broadcast_drop_all_layers`, `_evict_prefix_globally`. The two collateral paths the plan calls out (§2 paragraph 7) live here:
+Mapping helpers (lines 207-281) — `_add_holder`, `_remove_holder`, `_drop_layer_mapping`, `_broadcast_drop_all_layers`, `_evict_prefix_globally`. The two collateral paths the plan calls out (§2 paragraph 7) live here:
 - `_drop_layer_mapping` is the **per-layer-only** path — used when an expert miss in L overwrites L's bytes at a block.
 - `_broadcast_drop_all_layers` is the **across-all-layers** path — used only when KV writes overwrite every layer's bytes at a block (i.e. KV-allocation).
 
-Callbacks (lines 282-307):
+Callbacks (lines 287-325):
 - `_on_kv_allocation(block_ids)` — fired by BlockPool at the end of `get_new_blocks`. Calls `_broadcast_drop_all_layers` for each block. The KV writes are about to land; every layer's expert mapping there is now invalid.
 - `_on_prefix_added(block_id)` — fired when a block re-enters the free queue with a hash. Bumps to MRU on `prefix_lru`. **This is the bump-on-hit signal for prefix recency** (a request just finished using these bytes — that's the freshest last-used timestamp we have without an attention-side hook).
 - `_on_prefix_removed(block_id)` — fired when a block leaves the cached-prefix state (either pinned via `touch` or hash cleared). Drops from `prefix_lru`.
 
-`warm_up(warm_count)` (lines 313-342) — Stage 2 pre-fill. For each layer, claims `warm_count` blocks via `_select_victim_block` (with empty `needed_set`), assigns the first `warm_count` experts, DMAs each one synchronously, and re-appends the block to `free_block_queue` so the BlockPool still sees it as available for KV allocation.
+`warm_up(warm_count)` (lines 331-382) — Stage 2 pre-fill. **Shares one `block_id` per warmed expert across all layers.** The outer loop is over experts (not layers): for each `expert_id` in `range(warm_count)`, pick one block via `_select_victim_block` from layer 0's perspective (queue head), then iterate every layer and DMA `expert_id` into that same block_id's slot in each layer's per-layer pool buffer. Total block_ids consumed = `warm_count`, regardless of `num_layers`. After all DMAs, re-append the block to `free_block_queue` so the BlockPool still sees it as available for KV allocation. Synchronous DMAs (`_dma_expert_into_block_sync`) — warm-up is a one-shot startup step, not on the hot path.
 
-Forward-path API (lines 348-441):
+Forward-path API (lines 388-479):
 
 - `ensure_loaded(layer, needed_expert_ids)` — the hot path. Three passes:
   1. **Classify** hits vs misses (no mutation; trace snapshot captured here, *before* any state change).
@@ -112,33 +115,39 @@ Forward-path API (lines 348-441):
 
 - `end_forward_step()` — increments the global `step` counter. Logs stats every 100 steps. **Called once per forward (after all layers' MoE blocks have run)** — this is what the layer's `_forward_with_unified_pool` invokes after `release_pinned`.
 
-`_select_victim_block(layer, needed_set)` (lines 447-535) — three-tier victim search:
+`_select_victim_block(layer, needed_set) → (KVCacheBlock, tier_str)` (~lines 485-585) — three-tier victim search. Returns a tuple — the `tier_str` label is used for trace output and is one of:
+- `"free-pure"` — Tier 1 hit on a slot with no holders.
+- `"free-cross-layer-expert"` — Tier 1 hit on a slot that holds another layer's expert (safe to claim; pool buffers are per-layer).
+- `"expert-local"` — Tier 2 chose the cold end of L's own `expert_lru`.
+- `"prefix-global"` — Tier 2 chose the cold end of the shared `prefix_lru`.
 
 1. **Tier 1 — free space from L's view.** Walk `block_pool.free_block_queue` head→tail. Return the first block that is (a) not in L's `pinned_blocks`, (b) has no expert mapping in *L* (other layers' mappings don't matter — physical bytes are independent), and (c) has no prefix hash. This is what lets two layers independently use the same `block_id` for different experts.
 
-2. **Tier 2 — cold tail of L's mixed LRU.** Compare the front (oldest) of `layer.expert_lru` to the front of the shared `prefix_lru`. Pick whichever has the smaller `step` (= used longer ago). Skip pinned and currently-needed entries. The chosen block is removed from `free_block_queue` so the KV path can't pop it before the miss-DMA lands.
+2. **Tier 2 — cold tail of L's mixed LRU.** Compare the front (oldest) of `layer.expert_lru` to the front of the shared `prefix_lru`. Pick whichever has the smaller `step` (= used longer ago). Tie-break: prefix wins (`<=` favours prefix-global on equal step). Skip pinned and currently-needed entries. The chosen block is removed from `free_block_queue` so the KV path can't pop it before the miss-DMA lands.
 
 3. **Tier 3 — fail loudly.** Raise `RuntimeError`. The pool is exhausted; warn the operator to lower `--max-num-batched-tokens` or raise `--num-gpu-blocks-override`.
 
-DMA helpers (lines 541-562) — `_dma_expert_into_block_async` does the two `narrow().copy_()` calls, one for w13 and one for w2, into the layer's `pool_buffer`. The `_sync` variant wraps it in the transfer stream for warm-up.
+DMA helpers (lines 591-612) — `_dma_expert_into_block_async` does the two `narrow().copy_()` calls, one for w13 and one for w2, into the layer's `pool_buffer`. The `_sync` variant wraps it in the transfer stream for warm-up.
 
-Stats (lines 568-587) — `log_stats()` and `shutdown_log()` print per-layer hits/misses/hit-rate, expert page count, and shared kv-prefix page count.
+Trace helper (lines 618-687) — `_trace_pre_mutation` builds and prints the per-step header, `CACHE` composition counts, `EXPERT_LRU`, `PREFIX_LRU` (top 8), and `REQUEST` lines from `ensure_loaded` Pass 1, before any state mutation.
+
+Stats (lines 693-712) — `log_stats()` and `shutdown_log()` print per-layer hits/misses/hit-rate, expert page count, and shared kv-prefix page count.
 
 ### 2.4 `model_executor/layers/fused_moe/layer.py`
 
 Three blocks of changes inside `FusedMoE`:
 
-- `__init__` (around line 641) sets `self._unified_pool = None` and `self._unified_pool_enabled` based on the offload config. The pool object itself is attached later by Stage 2.
+- `__init__` (around line 641) sets `self._unified_pool = None` and `self._unified_pool_enabled` based on the offload config. The pool object itself is attached later by Stage 2. **Note:** `_unified_pool_enabled` is currently set but never read — `forward_native`'s dispatch checks `self._unified_pool is not None` directly. Safe to delete in a cleanup pass.
 
 - `_maybe_init_expert_cache` (around line 732) — extracted to use `move_experts_to_cpu` instead of inlining. **Should be guarded so it's a no-op when `_unified_pool_enabled`** — currently the worker (gpu_model_runner.py:4592-4599) handles the branch externally, so this method isn't called when the unified pool is on.
 
-- `unified_pool_stage1()` (lines 765-820) — Stage-1 entry point. Pins experts to CPU (`move_experts_to_cpu`), allocates the per-layer `staging_w13` and `staging_w2` GPU tensors, fills them once with all experts, stashes them and the CPU-pinned tensors on the module as `_unified_pool_staging_*` and `_unified_pool_cpu_*`, returns a metadata dict with `layer_idx`, `num_experts`, `w13_dtype`/`w2_dtype`, byte sizes per expert, and staging nbytes.
+- `unified_pool_stage1()` (lines 765-823) — Stage-1 entry point. Pins experts to CPU (`move_experts_to_cpu`), allocates the per-layer `staging_w13` and `staging_w2` GPU tensors, fills them once with all experts, stashes them and the CPU-pinned tensors on the module as `_unified_pool_staging_*` and `_unified_pool_cpu_*`, returns a metadata dict with `layer_idx`, `num_experts`, `w13_dtype`/`w2_dtype`, byte sizes per expert, and staging nbytes.
 
-- `attach_unified_pool(pool)` (line 826) — Stage-2 entry point. Stores the per-layer `UnifiedPool` so `forward_native` dispatches to `_forward_with_unified_pool`.
+- `attach_unified_pool(pool)` (line 825) — Stage-2 entry point. Stores the per-layer `UnifiedPool` so `forward_native` dispatches to `_forward_with_unified_pool`.
 
-- `forward_native` (around line 1626) — adds a branch at the top: if `self._unified_pool is not None`, dispatch to `_forward_with_unified_pool` before the existing `_expert_cache` path.
+- `forward_native` (line 1624) — adds a branch at the top: if `self._unified_pool is not None`, dispatch to `_forward_with_unified_pool` before the existing `_expert_cache` path.
 
-- `_forward_with_unified_pool` (lines 1641-1690) — the forward. Steps:
+- `_forward_with_unified_pool` (lines 1640-1689) — the forward. Steps:
   1. Run the router to get `topk_weights`, `topk_ids`.
   2. `needed_expert_ids = topk_ids.unique().tolist()`.
   3. `manager.ensure_loaded(pool, needed_expert_ids)`.
@@ -149,7 +158,7 @@ Three blocks of changes inside `FusedMoE`:
 
 ### 2.5 `v1/core/block_pool.py`
 
-Three callback lists added in `BlockPool.__init__` (lines 184-198):
+Three callback lists added in `BlockPool.__init__` (lines 188-198):
 - `_on_allocation_callbacks: list[Callable[[list[int]], None]]`
 - `_on_prefix_added_callbacks: list[Callable[[int], None]]`
 - `_on_prefix_removed_callbacks: list[Callable[[int], None]]`
@@ -164,9 +173,9 @@ Fan-out points:
 
 - `touch` (around line 440) — when a block transitions out of the free queue with a hash, fires `_on_prefix_removed_callbacks`. (When all refs release, `free_blocks` re-adds it to the prefix LRU.)
 
-- `free_blocks` (around line 463) — for every block re-entering the queue with a hash set, fires `_on_prefix_added_callbacks(block_id)`. **This is the bump-on-hit signal for prefix recency** — a request just finished, so this is the freshest last-used timestamp.
+- `free_blocks` (around line 477) — for every block re-entering the queue with a hash set, fires `_on_prefix_added_callbacks(block_id)`. **This is the bump-on-hit signal for prefix recency** — a request just finished, so this is the freshest last-used timestamp.
 
-New method `evict_prefix_hash(block_id) → bool` (lines 519-528) — public API for the unified pool to clear a cached-prefix hash globally when an expert miss reuses a previously cached block.
+New method `evict_prefix_hash(block_id) → bool` (lines 516-525) — public API for the unified pool to clear a cached-prefix hash globally when an expert miss reuses a previously cached block.
 
 ### 2.6 `v1/engine/core.py`
 
@@ -176,7 +185,7 @@ The `UniProcExecutor` assertion is intentional — multi-process serialization o
 
 ### 2.7 `v1/worker/gpu_worker.py`
 
-Five-line passthrough (lines 518-520):
+Three-line passthrough (lines 518-520):
 
 ```python
 def setup_unified_pool(self, block_pool) -> int:
@@ -188,8 +197,8 @@ def setup_unified_pool(self, block_pool) -> int:
 Three new methods on `GPUModelRunner`:
 
 - `_unified_pool_stage1()` (line 6557) — see §3.1 below.
-- `_unified_pool_capture_raw_kv(kv_cache_raw_tensors)` (line 6716) — small helper called from `_allocate_kv_cache_tensors` (around line 6267) to snapshot the per-layer KV byte tensor dict for Stage 2.
-- `setup_unified_pool(block_pool) → int` (line 6725) — see §3.4 below.
+- `_unified_pool_capture_raw_kv(kv_cache_raw_tensors)` (line 6715) — small helper called from `_allocate_kv_cache_tensors` (line 6267) to snapshot the per-layer KV byte tensor dict for Stage 2.
+- `setup_unified_pool(block_pool) → int` (line 6724) — see §3.4 below.
 
 Plus one branch in `load_model` (line 4592-4599):
 
@@ -241,7 +250,7 @@ Runs inside the worker's `load_model`, immediately after weights are loaded and 
    ```
    The `user_specified_block_size = True` flag is what stops `update_block_size_for_backend` (called from `UniProcExecutor._init_executor` after `load_model`) from clobbering this back to the backend's preferred 16. *That bug — using the wrong attribute name `block_size_user_specified` — was the cause of the boot failure where `num_gpu_blocks` came out as 13787 (= 16-token blocks) instead of 143 (= 1536-token blocks).*
 
-7. **Stash MoE module list and metadata** on the runner (lines 6708-6714) for Stage 2.
+7. **Stash MoE module list and metadata** on the runner (lines 6707-6713) for Stage 2.
 
 After Stage 1 returns:
 - `_init_executor` calls `update_block_size_for_backend` — short-circuits because of the user-specified flag.
@@ -261,7 +270,7 @@ The engine then constructs the scheduler, which constructs `KVCacheManager`, whi
 
 ### 3.4 Stage 2 — `setup_unified_pool(block_pool)`
 
-Triggered by `engine/core.py:160`'s collective RPC. Order (gpu_model_runner.py:6725):
+Triggered by `engine/core.py:160`'s collective RPC. Order (gpu_model_runner.py:6724):
 
 1. **Build `attn_layers: dict[layer_idx → torch.Tensor]`** by walking `compilation_config.static_forward_context`, filtering to `AttentionLayerBase`, matching against the captured raw-KV tensor dict, extracting `layer_idx` from the layer name, and storing the int8 view of the raw tensor.
 
@@ -271,14 +280,18 @@ Triggered by `engine/core.py:160`'s collective RPC. Order (gpu_model_runner.py:6
 
    The narrow is necessary because vLLM sizes per-layer KV tensors to their share of the available KV budget, which is generally larger than `num_gpu_blocks × page_size_bytes` (block IDs only address the first `num_gpu_blocks` pages). Without the narrow, the alias's last byte would land past the addressable region and the math would not balance. *This was the second boot failure — "KV byte tensor size 1807089664 is not a multiple of page_size_bytes 12582912".* The slack at the tail is unaddressable in the baseline too, so dropping it is fair-benchmark-neutral.
 
-4. **Warm-up sanity check** (line 6822):
-   ```
-   if expert_cache_size × num_moe_layers > num_gpu_blocks − 1:
+4. **Warm-up sanity check** (gpu_model_runner.py lines 6817-6831). The check is on `expert_cache_size` alone (not `× num_moe_layers`) because warm-up shares one `block_id` per warmed expert across **all** layers (`UnifiedPoolManager.warm_up`, unified_pool.py lines 331-382):
+   ```python
+   warm_count = expert_cache_size
+   num_blocks_available = block_pool.num_gpu_blocks - 1   # minus null block 0
+   if warm_count > num_blocks_available:
        raise RuntimeError(...)
    ```
-   The `−1` is for `BlockPool`'s null block at index 0. For `--expert-cache-size 12 × 16 layers = 192` against `num_gpu_blocks=143 − 1 = 142`, this raises and tells the operator to lower the cache size or raise the memory budget. For `--expert-cache-size 8`, it's `128 ≤ 142` and proceeds.
+   So the minimum viable `--num-gpu-blocks-override` is `expert_cache_size + 1`, regardless of `num_moe_layers`. For OLMoE's 16-layer setup with `--expert-cache-size 8`, the floor is 9 blocks; the disjoint-id design that this replaced had a floor of `cache_size × num_layers + 1 = 129` (see `problems.md` for the rationale). The operator-facing failure for over-provisioned `--expert-cache-size` is "Reduce --expert-cache-size or increase memory budget."
 
-5. **`manager.warm_up(expert_cache_size)`** — pre-loads the first `expert_cache_size` experts of each layer into the pool. This is for LRU residency tracking and realistic startup byte counts; the staging tensors already have every expert.
+5. **`manager.warm_up(expert_cache_size)`** — pre-loads the first `expert_cache_size` experts into the pool, one block_id shared across every layer per expert. This is for LRU residency tracking and realistic startup byte counts; the staging tensors already have every expert.
+
+   Trade-off: every warmed `block_id` has all `num_moe_layers` layers as holders. If KV-allocation later claims one of those ids, the kv-broadcast invalidates expert mappings in **every** layer at once — accepted because warm-up is just startup seeding and the LRU reshapes from there.
 
 Returns `block_pool.num_gpu_blocks` (the engine doesn't currently use the return value but the RPC signature reserves it).
 
@@ -321,7 +334,7 @@ _forward_with_unified_pool:
 The "no mapping in this layer" check (vs "no mapping in any layer") is the key insight. If layer 0 holds expert E_a at block 5, and layer 1 needs to claim block 5 for its own expert E_b, layer 1 is free to do so — layer 0's mapping at block 5 stays valid because layer 0's pool buffer at offset 5 isn't physically modified.
 
 **Tier 2 — cold tail of L's mixed LRU.** Take the head (oldest) of `layer.expert_lru` and the head of `manager.prefix_lru`, skipping pinned/needed entries on each side. Compare their `step` values:
-- If both exist: pick whichever has the smaller step. **Tie-break: prefix wins** (`<=` in line 516 means equal-recency picks the prefix entry).
+- If both exist: pick whichever has the smaller step. **Tie-break: prefix wins** (`oldest_prefix_step <= oldest_expert_step` favours the prefix entry on equal recency, ~line 561).
 - If only one exists: pick it.
 - If neither: raise (Tier 3 fail-loud).
 
@@ -371,7 +384,35 @@ UnifiedPool L0: hits=32296 misses=56 hit_rate=99.8% expert_pages=64 kv_prefix_pa
 - `expert_pages = len(layer.expert_at_block)` — experts pinned in *this layer's* buffer.
 - `kv_prefix_pages = len(manager.prefix_lru)` — global, same value on every layer's line.
 
-**Trace mode** (`VLLM_UNIFIED_POOL_TRACE=1`). Per-forward-per-layer emits three pre-mutation snapshots — `CACHE`, `NEED`, `RESULT` — and one line per eviction: `EVICT page=… L<n> kind={expert E<eid> | kv-prefix} cause={kv-alloc | expert-L<m>}`. Used by the §6.6 architectural acceptance grep checks. The variable is unregistered in `vllm/envs.py`, so vLLM warns "Unknown vLLM environment variable detected: VLLM_UNIFIED_POOL_TRACE" at startup — cosmetic only, the read uses `os.environ.get` directly.
+**Trace mode** (`VLLM_UNIFIED_POOL_TRACE=1`). The actual trace format diverges from the plan §6.6 spec — what is emitted now, per forward per layer, all snapshots captured **before** mutation in `ensure_loaded`:
+
+```
+=== STEP <step> L<n> need=[E…] ===
+UNIFIED CACHE L<n> occ <expert-ours>/<capacity> ours (expert-ours=…, expert-other=…, prefix=…, alloc-kv=…, pinned=…, free-pure=…)
+UNIFIED EXPERT_LRU L<n> MRU→LRU [<count>]: E<eid>@p<page>#step<step>, …
+UNIFIED PREFIX_LRU MRU→LRU [top 8 of <count>]: p<page>#step<step>, …
+UNIFIED REQUEST L<n>: E<eid>,…
+UNIFIED CLAIM page=<id> L<n> E<eid> cause=expert-L<n> tier=free-…           # only for Tier-1 free claims
+UNIFIED EVICT page=<id> L<n> kind=expert E<eid> cause=expert-L<n> tier=…    # per Tier-2 eviction
+UNIFIED EVICT page=<id> L=all kind=kv-prefix cause=… tier=…                 # per global prefix eviction
+UNIFIED EVICT page=<id> L<m> kind=expert E<eid> cause=kv-alloc tier=kv-broadcast  # per KV-allocation invalidation
+UNIFIED RESULT L<n> hits=[E<eid>@p<page>,…] misses=[E<eid>->p<page>(tier),…]
+--- end L<n> ---
+```
+
+Plus prefix-LRU lifecycle lines (fired from BlockPool callbacks, not per-layer):
+```
+UNIFIED PREFIX_ADDED p<id> step=<step> size=<count>
+UNIFIED PREFIX_REMOVED p<id> was_present=<yes|no> size=<count>
+```
+
+Notable divergences from plan §6.6:
+- The plan said `CACHE` would be a "page→expert listing"; in practice `UNIFIED CACHE` emits only composition counts. The page→expert listing lives in `UNIFIED EXPERT_LRU` instead.
+- The plan called the request line `NEED`; the implementation emits `UNIFIED REQUEST`.
+- `EVICT` lines carry an extra `tier=…` field (Tier-1 `free-cross-layer-expert`, Tier-2 `expert-local`/`prefix-global`, KV-broadcast `kv-broadcast`).
+- The plan §6.6 "hit/miss self-consistency" grep check therefore needs to compare `RESULT` HITs against `EXPERT_LRU`, not `CACHE`.
+
+The variable is unregistered in `vllm/envs.py`, so vLLM warns "Unknown vLLM environment variable detected: VLLM_UNIFIED_POOL_TRACE" at startup — cosmetic only, the read uses `os.environ.get` directly.
 
 **Shutdown summary**. `manager.shutdown_log()` exists but is not currently wired to a shutdown hook.
 

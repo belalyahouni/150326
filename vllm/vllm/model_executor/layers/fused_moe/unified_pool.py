@@ -2,13 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unified per-layer page pool for MoE expert weights and KV blocks.
 
-Phase 1 MVP: each MoE layer's KV byte tensor is aliased as a "pool buffer"
+Phase 2: each MoE layer's KV byte tensor is aliased as a "pool buffer"
 shared between cached-prefix KV blocks and expert weight pages. A per-layer
 expert-recency list and one shared prefix-recency list together form the
-"per-layer mixed LRU" the plan describes — both bumped on every hit, both
-consulted at eviction time. The unmodified Triton fused_moe kernel still
-reads from a static staging tensor (full-width); real CPU->GPU DMAs on
-miss exercise PCIe latency honestly.
+"per-layer mixed LRU" — both bumped on every hit, both consulted at
+eviction time. The unmodified Triton fused_moe kernel reads expert weights
+**directly** from the pool buffer via a strided view: row ``b`` of the
+view is whatever block_id ``b`` currently holds. ``topk_ids`` is remapped
+per-layer from global expert ids to block_ids (via ``block_id_at``), and
+``global_num_experts`` is set to ``num_gpu_blocks`` for the kernel call.
+No staging tensor, no GPU->GPU gather, no extra GPU memory beyond the pool.
 """
 
 import os
@@ -48,58 +51,125 @@ def move_experts_to_cpu(
 
 
 class UnifiedPool:
-    """Per-layer pool state.
+    """Per-layer pool state (Phase 2).
 
     Holds:
-      - ``staging_w13``, ``staging_w2``: full-width GPU tensors
-        ``[num_experts, ...]`` filled once at startup. The unmodified
-        MoE kernel reads from these every forward.
       - ``cpu_w13``, ``cpu_w2``: CPU-pinned source-of-truth tensors used
         as DMA source on a miss.
       - ``pool_buffer``: flat int8 view of the layer's KV byte tensor.
-        Real CPU->GPU DMAs land here on miss to exercise PCIe; the
-        kernel never reads it (Phase 1 simulation).
+        Real CPU->GPU DMAs land here on miss; **the MoE kernel reads
+        directly from this buffer via the strided views below**.
+      - ``pool_w13_view``: strided ``[num_gpu_blocks, 2*I, H]`` view onto
+        ``pool_buffer`` with ``stride(0) = page_size_bytes / element_size``.
+        Row ``b`` of this view is whatever block_id ``b`` currently holds
+        (an expert's w13 if loaded; arbitrary bytes if KV/free/empty).
+        Handed to the unmodified Triton kernel each forward.
+      - ``pool_w2_view``: same idea, with ``storage_offset = w13_bytes /
+        element_size`` so each row points at the w2 bytes within a page.
       - ``expert_at_block: dict[block_id -> expert_id]``: which expert
         ``L`` currently has loaded at this block.
       - ``block_at_expert: dict[expert_id -> block_id]``: inverse.
+      - ``block_id_at: torch.Tensor[num_experts] int64`` (GPU): mirror of
+        ``block_at_expert`` for GPU-side ``topk_ids`` remap. Sentinel ``-1``
+        means "not loaded." Updated on every ``assign``/``drop``. Indexed
+        by ``topk_ids`` in the forward path: ``remapped = block_id_at[topk_ids]``.
       - ``expert_lru: OrderedDict[expert_id, step]``: per-layer expert
         recency, oldest first. ``move_to_end`` on every hit. **This is
         the structure consulted at eviction time** — it is not a side
         record.
       - ``pinned_blocks: set[block_id]``: blocks pinned during the
         current forward (kept off the eviction-candidate list until
-        release).
+        release). In Phase 2 the kernel reads ``pool_buffer`` directly,
+        so this set is **load-bearing** — a stale eviction here is
+        silent corruption, not a recoverable miss.
     """
+
+    _UNLOADED = -1  # sentinel for block_id_at
 
     def __init__(
         self,
         layer_idx: int,
         num_experts: int,
-        staging_w13: torch.Tensor,
-        staging_w2: torch.Tensor,
         cpu_w13: torch.Tensor,
         cpu_w2: torch.Tensor,
         pool_buffer: torch.Tensor,
         page_size_bytes: int,
         w13_bytes: int,
         w2_bytes: int,
+        device: torch.device,
     ) -> None:
         self.layer_idx = layer_idx
         self.num_experts = num_experts
-        self.staging_w13 = staging_w13
-        self.staging_w2 = staging_w2
         self.cpu_w13 = cpu_w13
         self.cpu_w2 = cpu_w2
         self.pool_buffer = pool_buffer
         self.page_size_bytes = page_size_bytes
         self.w13_bytes = w13_bytes
         self.w2_bytes = w2_bytes
+        self.device = device
         assert w13_bytes + w2_bytes == page_size_bytes, (
             f"page_size_bytes ({page_size_bytes}) must equal "
             f"w13_bytes + w2_bytes ({w13_bytes + w2_bytes})"
         )
+        # Element size has to divide page_size / w13 / w2 cleanly so the
+        # strided views land on whole elements.
+        elem_size = cpu_w13.element_size()
+        assert page_size_bytes % elem_size == 0, (
+            f"page_size_bytes ({page_size_bytes}) must be a multiple of "
+            f"element size ({elem_size})"
+        )
+        assert w13_bytes % elem_size == 0
+        assert w2_bytes % elem_size == 0
+
         self._cpu_w13_bytes = cpu_w13.view(torch.int8).reshape(num_experts, -1)
         self._cpu_w2_bytes = cpu_w2.view(torch.int8).reshape(num_experts, -1)
+
+        # ---- Strided views over the pool buffer (Phase 2 kernel input) ----
+        # Reinterpret the int8 pool_buffer as the layer's weight dtype.
+        pool_typed = pool_buffer.view(cpu_w13.dtype)
+        page_size_elems = page_size_bytes // elem_size
+        w13_offset_elems = 0
+        w2_offset_elems = w13_bytes // elem_size
+
+        # cpu_w13 has shape [num_experts, *w13_per_expert_shape]. The
+        # strided view exposes the same per-expert layout but with one
+        # row per pool block, separated by `page_size_elems` rather than
+        # by the natural per-expert size. Within a row, the strides
+        # match the natural row-major layout that DMAs deposit.
+        w13_per_expert_shape = cpu_w13.shape[1:]
+        w13_per_expert_strides = cpu_w13[0].contiguous().stride()
+        num_gpu_blocks = pool_typed.numel() // page_size_elems
+        self.num_gpu_blocks = num_gpu_blocks
+
+        self.pool_w13_view = torch.as_strided(
+            pool_typed,
+            size=(num_gpu_blocks, *w13_per_expert_shape),
+            stride=(page_size_elems, *w13_per_expert_strides),
+            storage_offset=w13_offset_elems,
+        )
+        w2_per_expert_shape = cpu_w2.shape[1:]
+        w2_per_expert_strides = cpu_w2[0].contiguous().stride()
+        self.pool_w2_view = torch.as_strided(
+            pool_typed,
+            size=(num_gpu_blocks, *w2_per_expert_shape),
+            stride=(page_size_elems, *w2_per_expert_strides),
+            storage_offset=w2_offset_elems,
+        )
+        # Sanity: kernel asserts stride(-1) == 1 on the weight tensors
+        # (vllm/model_executor/layers/fused_moe/fused_moe.py).
+        assert self.pool_w13_view.stride(-1) == 1
+        assert self.pool_w2_view.stride(-1) == 1
+
+        # ---- Per-layer expert -> block_id lookup (GPU) ----
+        # int64 to match the kernel's int64 cast on expert ids and to
+        # avoid overflow in stride * offset when `topk_ids` is indexed
+        # through it. Sentinel `_UNLOADED = -1` means "not in pool."
+        self.block_id_at = torch.full(
+            (num_experts,),
+            self._UNLOADED,
+            dtype=torch.int64,
+            device=device,
+        )
 
         self.expert_at_block: dict[int, int] = {}
         self.block_at_expert: dict[int, int] = {}
@@ -131,6 +201,8 @@ class UnifiedPool:
         self.expert_at_block[block_id] = expert_id
         self.block_at_expert[expert_id] = block_id
         self.expert_lru[expert_id] = step  # MRU on insert
+        # Mirror to GPU lookup for the forward-path topk_ids remap.
+        self.block_id_at[expert_id] = block_id
 
     def drop(self, block_id: int) -> int | None:
         expert_id = self.expert_at_block.pop(block_id, None)
@@ -138,6 +210,11 @@ class UnifiedPool:
             return None
         del self.block_at_expert[expert_id]
         self.expert_lru.pop(expert_id, None)
+        # Invalidate the GPU lookup entry so a stale block_id can't be
+        # returned by ``block_id_at[topk_ids]``. ``ensure_loaded`` is
+        # responsible for ensuring no expert id in the next forward
+        # ever resolves to ``_UNLOADED``.
+        self.block_id_at[expert_id] = self._UNLOADED
         return expert_id
 
     def bump_expert(self, expert_id: int, step: int) -> None:
@@ -241,7 +318,13 @@ class UnifiedPoolManager:
         """Drop every layer's mapping at ``block_id`` (KV allocation).
 
         Used when KV writes physically overwrite all layers' bytes at
-        this block.
+        this block. In Phase 2 the kernel reads ``pool_buffer`` directly,
+        so dropping a mapping while the kernel is reading those bytes
+        would be silent corruption. Guard against it by asserting no
+        layer has the block pinned. The synchronous engine loop
+        (``async_scheduling=False`` is required) guarantees scheduler
+        KV allocations and worker forwards never overlap, so this
+        assertion should hold trivially — it's defense-in-depth.
         """
         holders = self.block_holder.pop(block_id, None)
         if not holders:
@@ -250,6 +333,12 @@ class UnifiedPoolManager:
             layer = self.layers.get(layer_idx)
             if layer is None:
                 continue
+            assert block_id not in layer.pinned_blocks, (
+                f"KV-allocation broadcast tried to drop a pinned block: "
+                f"page={block_id} L{layer_idx} cause={cause}. The MoE "
+                f"kernel may be reading those bytes — refusing to "
+                f"corrupt. Check async_scheduling is disabled."
+            )
             evicted = layer.drop(block_id)
             if evicted is not None and _trace_enabled():
                 print(
@@ -303,13 +392,26 @@ class UnifiedPoolManager:
         """
         self.prefix_lru[block_id] = self.step
         self.prefix_lru.move_to_end(block_id, last=True)
+        if _trace_enabled():
+            print(
+                f"UNIFIED PREFIX_ADDED p{block_id} step={self.step} "
+                f"size={len(self.prefix_lru)}",
+                flush=True,
+            )
 
     def _on_prefix_removed(self, block_id: int) -> None:
         """The block stopped being an evictable cached-prefix entry —
         either ``touch`` pinned it for active use, or its hash was
         cleared. Either way, drop from the prefix-recency list.
         """
-        self.prefix_lru.pop(block_id, None)
+        removed = self.prefix_lru.pop(block_id, None)
+        if _trace_enabled():
+            was_present = "yes" if removed is not None else "no"
+            print(
+                f"UNIFIED PREFIX_REMOVED p{block_id} "
+                f"was_present={was_present} size={len(self.prefix_lru)}",
+                flush=True,
+            )
 
     # ------------------------------------------------------------------
     # Warm-up at Stage 2
@@ -359,7 +461,17 @@ class UnifiedPoolManager:
                     layer, expert_id, block_id
                 )
             self.block_pool.free_block_queue.append(block)
-        torch.cuda.current_stream(self.device).synchronize()
+        # Warm-up DMAs are queued on ``transfer_stream``. Make the
+        # default (compute) stream wait for them, then full-device
+        # synchronize. Phase-2 critical: if the first forward has all
+        # hits and no miss-DMA, ``ensure_loaded`` never calls
+        # ``wait_stream`` and the kernel would otherwise read stale
+        # pool bytes. Make sure warm-up is fully flushed before any
+        # forward can start.
+        torch.cuda.current_stream(self.device).wait_stream(
+            self.transfer_stream
+        )
+        torch.cuda.synchronize(self.device)
         for layer in layers_list:
             logger.info(
                 "UnifiedPool L%d: warmed %d/%d experts",
@@ -367,6 +479,36 @@ class UnifiedPoolManager:
                 warm_count,
                 layer.num_experts,
             )
+
+        # ---- Post-warm-up sanity check (Phase 2) ----
+        # Verify pool_w13_view[block_id] and pool_w2_view[block_id] hold
+        # exactly cpu_w13[expert_id] / cpu_w2[expert_id] for every warmed
+        # (expert, block) pair. If this fails, either the strided view
+        # is misaligned with the DMA byte layout, or the warm-up DMAs
+        # have not actually landed.
+        for layer in layers_list:
+            for expert_id, block_id in layer.block_at_expert.items():
+                w13_view_row = layer.pool_w13_view[block_id]
+                w2_view_row = layer.pool_w2_view[block_id]
+                w13_truth = layer.cpu_w13[expert_id].to(layer.device)
+                w2_truth = layer.cpu_w2[expert_id].to(layer.device)
+                if not torch.equal(w13_view_row, w13_truth):
+                    raise RuntimeError(
+                        f"UnifiedPool L{layer.layer_idx}: pool_w13_view"
+                        f"[{block_id}] != cpu_w13[{expert_id}] after warm-up. "
+                        f"Strided view layout is wrong, or DMA didn't land."
+                    )
+                if not torch.equal(w2_view_row, w2_truth):
+                    raise RuntimeError(
+                        f"UnifiedPool L{layer.layer_idx}: pool_w2_view"
+                        f"[{block_id}] != cpu_w2[{expert_id}] after warm-up."
+                    )
+        logger.info(
+            "UnifiedPool warm-up sanity check passed: %d (expert, block) "
+            "pairs verified across %d layers.",
+            warm_count * len(layers_list),
+            len(layers_list),
+        )
 
     # ------------------------------------------------------------------
     # Forward-path API

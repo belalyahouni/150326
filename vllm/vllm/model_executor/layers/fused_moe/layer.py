@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable, Iterable
 from enum import Enum
 from typing import Any, Literal, cast, get_args, overload
@@ -763,10 +764,14 @@ class FusedMoE(CustomOp):
         )
 
     def unified_pool_stage1(self) -> dict[str, Any]:
-        """Stage-1 of unified pool init: pin experts to CPU and allocate
-        the per-layer staging tensors. Runs *before* the memory profile
-        so the profiler subtracts staging from the budget reported to
-        the scheduler.
+        """Stage-1 of unified pool init (Phase 2): pin experts to CPU
+        and stash the pinned tensors for Stage 2.
+
+        Phase 2 reads expert weights directly from the pool buffer, so
+        no GPU staging is allocated here. The CPU-pinned tensors are
+        the DMA source on miss; the GPU pool buffer (allocated later
+        as the KV byte tensor alias) is the kernel's read source via
+        the strided views built inside ``UnifiedPool.__init__``.
 
         Returns metadata describing this layer's expert slot, used by
         the worker to derive ``block_size_tokens``.
@@ -784,20 +789,6 @@ class FusedMoE(CustomOp):
         self.w13_weight = torch.nn.Parameter(cpu_w13, requires_grad=False)
         self.w2_weight = torch.nn.Parameter(cpu_w2, requires_grad=False)
 
-        device = torch.device("cuda", torch.cuda.current_device())
-        staging_w13 = torch.empty(
-            cpu_w13.shape, dtype=cpu_w13.dtype, device=device
-        )
-        staging_w2 = torch.empty(
-            cpu_w2.shape, dtype=cpu_w2.dtype, device=device
-        )
-        # Fill the staging tensors with all experts. The kernel will
-        # read from them every forward (Phase 1 simulation).
-        staging_w13.copy_(cpu_w13, non_blocking=True)
-        staging_w2.copy_(cpu_w2, non_blocking=True)
-
-        self._unified_pool_staging_w13 = staging_w13
-        self._unified_pool_staging_w2 = staging_w2
         self._unified_pool_cpu_w13 = cpu_w13
         self._unified_pool_cpu_w2 = cpu_w2
 
@@ -816,10 +807,6 @@ class FusedMoE(CustomOp):
             "w13_bytes_per_expert": w13_bytes_per_expert,
             "w2_bytes_per_expert": w2_bytes_per_expert,
             "expert_slot_bytes": w13_bytes_per_expert + w2_bytes_per_expert,
-            "staging_w13_nbytes": staging_w13.numel()
-            * staging_w13.element_size(),
-            "staging_w2_nbytes": staging_w2.numel()
-            * staging_w2.element_size(),
         }
 
     def attach_unified_pool(self, pool) -> None:
@@ -1642,19 +1629,29 @@ class FusedMoE(CustomOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass using the unified per-layer page pool.
+        """Forward pass using the unified per-layer page pool (Phase 2).
 
         1. Route tokens to experts and dedupe to needed expert ids.
         2. Manager ensures them loaded — pins hits, allocates+DMAs misses.
-        3. Swap ``w13_weight``/``w2_weight`` to point at the layer's
-           static staging tensors (full width, all experts present).
-           Leave ``global_num_experts`` and ``topk_ids`` unchanged
-           (Phase 1 staging is full-width).
-        4. Run ``quant_method.apply`` inside try/finally that restores
+        3. Remap ``topk_ids`` from global expert ids to per-layer
+           block_ids via ``pool.block_id_at`` (a small int64 GPU tensor).
+        4. Swap ``w13_weight.data`` / ``w2_weight.data`` to point at the
+           strided pool views (``[num_gpu_blocks, *expert_shape]``).
+           Set ``global_num_experts = num_gpu_blocks`` and
+           ``_expert_map = None`` so ``moe_align_block_size`` and the
+           kernel see a self-consistent index space.
+        5. Run ``quant_method.apply`` inside try/finally that restores
            the originals.
-        5. Release pinned blocks and advance the manager's step counter.
-           (The MRU bumps happen inside ``ensure_loaded`` for both hits
-           and misses; no separate ``mark_recently_used`` is needed.)
+        6. Release pinned blocks and advance the manager's step counter.
+
+        Same trick as ``_forward_with_expert_cache``, with two
+        substitutions: "cache slot" → "pool block_id," and "contiguous
+        ``[cache_size, ...]`` GPU tensor" → "strided
+        ``[num_gpu_blocks, ...]`` view over the pool buffer." The kernel
+        is unmodified — the strided view's ``stride(0) = page_size_bytes
+        / element_size`` makes the kernel walk one page per expert row,
+        even though successive rows aren't packed contiguously (the
+        gap holds w2 within each page).
         """
         assert self._unified_pool is not None
         pool = self._unified_pool
@@ -1668,21 +1665,71 @@ class FusedMoE(CustomOp):
         needed_expert_ids = topk_ids.unique().tolist()
         manager.ensure_loaded(pool, needed_expert_ids)
 
+        # Remap global expert ids → per-layer block_ids. After
+        # ``ensure_loaded``, every expert id in ``topk_ids`` has a
+        # valid (non-sentinel) entry in ``block_id_at``. Indexing in
+        # ``int64`` matches the kernel's int64 cast on expert ids.
+        remapped_ids = pool.block_id_at[topk_ids]
+
+        # ---- Phase-2 paranoid byte check (one-shot, layer 0 only) ----
+        # Prove the kernel will read the right bytes at kernel-call time.
+        # Compare each unique remapped block_id's pool_w13_view row
+        # against the CPU truth for the expert it should hold.
+        if (
+            os.environ.get("VLLM_UNIFIED_POOL_PARANOID", "0") == "1"
+            and pool.layer_idx == 0
+            and pool.forward_count == 0
+        ):
+            unique_blocks = remapped_ids.unique().tolist()
+            for bid in unique_blocks:
+                eid = pool.expert_at_block.get(bid)
+                if eid is None:
+                    raise RuntimeError(
+                        f"L0: kernel will read block {bid} but no expert "
+                        f"is mapped there"
+                    )
+                w13_truth = pool.cpu_w13[eid].to(pool.device)
+                w13_actual = pool.pool_w13_view[bid]
+                if not torch.equal(w13_actual, w13_truth):
+                    raise RuntimeError(
+                        f"L0: pool_w13_view[{bid}] does not match "
+                        f"cpu_w13[E{eid}] at kernel-call time. Bytes "
+                        f"corrupted between warm-up and forward."
+                    )
+                w2_truth = pool.cpu_w2[eid].to(pool.device)
+                w2_actual = pool.pool_w2_view[bid]
+                if not torch.equal(w2_actual, w2_truth):
+                    raise RuntimeError(
+                        f"L0: pool_w2_view[{bid}] does not match "
+                        f"cpu_w2[E{eid}] at kernel-call time."
+                    )
+            logger.info(
+                "Phase-2 paranoid: L0 forward 0 verified pool views vs CPU "
+                "truth for %d unique block_ids before kernel call.",
+                len(unique_blocks),
+            )
+
         orig_w13 = self.w13_weight.data
         orig_w2 = self.w2_weight.data
+        orig_num_experts = self.global_num_experts
+        orig_expert_map = self._expert_map
         try:
-            self.w13_weight.data = pool.staging_w13
-            self.w2_weight.data = pool.staging_w2
+            self.w13_weight.data = pool.pool_w13_view
+            self.w2_weight.data = pool.pool_w2_view
+            self.global_num_experts = pool.num_gpu_blocks
+            self._expert_map = None
             result = self.quant_method.apply(
                 layer=self,
                 x=hidden_states,
                 topk_weights=topk_weights,
-                topk_ids=topk_ids,
+                topk_ids=remapped_ids,
                 shared_experts_input=None,
             )
         finally:
             self.w13_weight.data = orig_w13
             self.w2_weight.data = orig_w2
+            self.global_num_experts = orig_num_experts
+            self._expert_map = orig_expert_map
 
         manager.release_pinned(pool)
         manager.end_forward_step()

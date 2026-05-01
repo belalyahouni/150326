@@ -146,7 +146,7 @@ Branch the existing post-load expert-offload hook: when `expert_unified_pool` is
 - Assert `expert_cache_size <= num_gpu_blocks - 1` (account for `BlockPool`'s null block at index 0). If it fails, **abort with a clear error** — do not silently shrink. The minimum viable `--num-gpu-blocks-override` is therefore `expert_cache_size + 1`, regardless of layer count.
 - Trade-off this creates: every warmed `block_id` is held by all `num_moe_layers` layers simultaneously, so if KV-allocation later claims one of those ids the kv-broadcast invalidates all layers' expert mappings at that id at once. This is acceptable — warm-up is just startup seeding, the LRU reshapes from there — and is the price paid for the smaller pool floor.
 
-Expose two thin RPC passthroughs on the worker (`setup_unified_pool`, `get_unified_pool_block_count`) for engine-side dispatch.
+Expose a thin RPC passthrough on the worker (`setup_unified_pool`) for engine-side dispatch. The implementation collapses what was originally planned as two RPCs into one — `setup_unified_pool` returns `block_pool.num_gpu_blocks` so a separate `get_unified_pool_block_count` RPC isn't needed (the engine doesn't currently consume the return value, but the signature reserves it).
 
 ### Engine wiring — `vllm/v1/engine/core.py`
 
@@ -163,17 +163,34 @@ Work through these in order; do not declare done until every step passes.
 3. **Correctness smoke test.** One short completion. Compare tokens to the same model with `--expert-offload` only (no unified pool). Should match modulo BF16 nondeterminism.
 4. **KV-hot scenario.** Run unified with an expert-heavy initial `--expert-cache-size` (the "wrong" static split for this workload). TTFT must drop to within ~15% of the static baseline configured with the workload-tuned (KV-heavy) split.
 5. **Expert-hot scenario.** Run unified with a KV-heavy initial `--expert-cache-size` (again, the "wrong" static split). TPOT must drop to within ~15% of the static baseline configured with the workload-tuned (expert-heavy) split.
-6. **Per-layer invariant — architectural acceptance test.** Env-gated trace logging (`VLLM_UNIFIED_POOL_TRACE=1`). Per layer-forward emit three lines, **all snapshots captured before any state mutation**:
-   - `CACHE` — page→expert listing
-   - `NEED` — unique experts requested
-   - `RESULT` — hits as `E<eid>@p<page>`, misses as `E<eid>->p<page>`
+6. **Per-layer invariant — architectural acceptance test.** Env-gated trace logging (`VLLM_UNIFIED_POOL_TRACE=1`). The **actual** format the implementation emits (snapshots captured before any state mutation in `ensure_loaded`):
 
-   Per eviction emit one line:
-   - `EVICT page=<id> L<n> kind={expert E<eid> | kv-prefix} cause={kv-alloc | expert-L<m>}`
+   Per layer-forward header + snapshots:
+   - `=== STEP <step> L<n> need=[E…] ===`
+   - `UNIFIED CACHE L<n> occ X/Y ours (expert-ours=…, expert-other=…, prefix=…, alloc-kv=…, pinned=…, free-pure=…)` — composition counts.
+   - `UNIFIED EXPERT_LRU L<n> MRU→LRU [k]: E<eid>@p<page>#step<step>, …` — **page→expert listing lives here, not in `CACHE`**.
+   - `UNIFIED PREFIX_LRU MRU→LRU [top 8 of k]: p<page>#step<step>, …`
+   - `UNIFIED REQUEST L<n>: E<eid>,…` — unique experts requested (this is the line the original spec called `NEED`).
+
+   Per Tier-1 free claim:
+   - `UNIFIED CLAIM page=<id> L<n> E<eid> cause=expert-L<n> tier={free-pure|free-cross-layer-expert}`
+
+   Per eviction (Tier-2 expert-side, prefix-global, or KV-broadcast):
+   - `UNIFIED EVICT page=<id> L<n> kind=expert E<eid> cause=expert-L<n> tier={expert-local|prefix-global}`
+   - `UNIFIED EVICT page=<id> L=all kind=kv-prefix cause=expert-L<n> tier=…`
+   - `UNIFIED EVICT page=<id> L<m> kind=expert E<eid> cause=kv-alloc tier=kv-broadcast`
+
+   Per layer-forward result:
+   - `UNIFIED RESULT L<n> hits=[E<eid>@p<page>,…] misses=[E<eid>->p<page>(tier),…]`
+   - `--- end L<n> ---`
+
+   Plus prefix-LRU lifecycle (fired from BlockPool callbacks, not per-layer):
+   - `UNIFIED PREFIX_ADDED p<id> step=<step> size=<count>`
+   - `UNIFIED PREFIX_REMOVED p<id> was_present=<yes|no> size=<count>`
 
    Two grep checks the agent **must** run:
-   - **Hit/miss self-consistency.** Every HIT page in a `RESULT` must appear in the same forward's preceding `CACHE`; every MISS page must not. Failure means the trace was captured after mutation.
-   - **No expert-driven cross-layer expert eviction.** For every `EVICT` line where `kind=expert E<…>` and `cause=expert-L<m>`, the evicted-layer field `L<n>` must equal `L<m>`. Any mismatch means an expert miss in one layer wiped another layer's expert — that's the previous-iteration bug (§7.1). Do not proceed. `kind=kv-prefix` lines are *allowed* to fan out across layers (cached prefix is global, so the eviction is by design global) and `cause=kv-alloc` lines are expected to wipe across layers.
+   - **Hit/miss self-consistency.** Every HIT page in `UNIFIED RESULT` must appear in the same forward's preceding `UNIFIED EXPERT_LRU` (the page→expert listing — `CACHE` only carries counts in this format); every MISS page must not. Failure means the trace was captured after mutation.
+   - **No expert-driven cross-layer expert eviction.** For every `UNIFIED EVICT` line where `kind=expert E<…>` and `cause=expert-L<m>`, the evicted-layer field `L<n>` must equal `L<m>`. Any mismatch means an expert miss in one layer wiped another layer's expert — that's the previous-iteration bug (§7.1). Do not proceed. `kind=kv-prefix` lines are *allowed* to fan out across layers (cached prefix is global, so the eviction is by design global) and `cause=kv-alloc tier=kv-broadcast` lines are expected to wipe across layers.
 7. **Stats and dynamics.** Manager prints per-layer hits/misses every ~100 steps and at shutdown. Pool composition (kv / expert / empty / pinned) logged at the same cadence — should shift toward KV-heavy under the KV-hot scenario and expert-heavy under the expert-hot scenario. **This is the dissertation evidence.**
 
 ---

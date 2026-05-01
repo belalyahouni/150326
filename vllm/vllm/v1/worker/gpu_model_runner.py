@@ -6595,9 +6595,24 @@ class GPUModelRunner(
         if self.scheduler_config.max_num_batched_tokens != 1:
             raise ValueError(
                 "--expert-unified-pool requires --max-num-batched-tokens=1 "
-                "in the Phase 1 MVP (got %d). A long prefill batch can "
-                "exhaust pool pages mid-call."
+                "(got %d). A long prefill batch can exhaust pool pages "
+                "mid-call."
                 % self.scheduler_config.max_num_batched_tokens
+            )
+        if getattr(self.scheduler_config, "async_scheduling", False):
+            # Phase 2 reads pool bytes directly from the kernel — the
+            # pinning contract assumes scheduler KV-allocation cannot
+            # interleave with worker forwards. async_scheduling=True
+            # would make scheduler KV-allocation broadcasts fire while
+            # a prior batch's MoE kernel may still be reading pool
+            # bytes. The byte-level race is benign in theory (KV
+            # writes serialize via the CUDA stream), but the metadata
+            # invariants the unified pool relies on do not hold.
+            raise ValueError(
+                "--expert-unified-pool requires async_scheduling=False. "
+                "Phase 2 has the kernel read pool bytes directly; "
+                "concurrent scheduler KV-allocation breaks the pinning "
+                "contract."
             )
 
         moe_metas: list[dict[str, Any]] = []
@@ -6688,20 +6703,15 @@ class GPUModelRunner(
         # override it (e.g. update_block_size_for_backend).
         self.cache_config.user_specified_block_size = True
 
-        total_staging_bytes = sum(
-            meta["staging_w13_nbytes"] + meta["staging_w2_nbytes"]
-            for meta in moe_metas
-        )
         logger.info(
-            "UnifiedPool Stage 1: %d MoE layers, expert_slot=%d B, "
-            "bytes/token=%d, block_size: %s -> %d tokens, "
-            "staging overhead=%.3f GiB",
+            "UnifiedPool Stage 1 (Phase 2): %d MoE layers, expert_slot=%d B, "
+            "bytes/token=%d, block_size: %s -> %d tokens. "
+            "No staging tensor — kernel reads pool buffer directly.",
             len(moe_modules),
             expert_slot_bytes,
             bytes_per_token,
             old_block_size,
             block_size_tokens,
-            total_staging_bytes / (1024**3),
         )
 
         self._unified_pool_moe_modules = moe_modules
@@ -6800,14 +6810,13 @@ class GPUModelRunner(
             pool = UnifiedPool(
                 layer_idx=layer_idx,
                 num_experts=meta["num_experts"],
-                staging_w13=moe_module._unified_pool_staging_w13,
-                staging_w2=moe_module._unified_pool_staging_w2,
                 cpu_w13=moe_module._unified_pool_cpu_w13,
                 cpu_w2=moe_module._unified_pool_cpu_w2,
                 pool_buffer=pool_buffer,
                 page_size_bytes=page_size_bytes,
                 w13_bytes=self._unified_pool_w13_bytes,
                 w2_bytes=self._unified_pool_w2_bytes,
+                device=self.device,
             )
             pool.manager = manager  # back-reference for forward path
             manager.register_layer(pool)

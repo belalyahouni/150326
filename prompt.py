@@ -1,5 +1,5 @@
 word = ""
-for i in range(2000):
-    word += "t "
+for i in range(3000):
+    word += "a "
 
 print(word)
