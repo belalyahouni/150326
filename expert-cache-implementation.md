@@ -145,7 +145,7 @@ The MoE kernel reads weights from `layer.w13_weight` and uses `layer.global_num_
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
-  --model mistralai/Mixtral-8x7B-Instruct-v0.1 \
+  --model allenai/OLMoE-1B-7B-0924-Instruct \
   --expert-offload \
-  --expert-cache-size 4
+  --expert-cache-size 8
 ```

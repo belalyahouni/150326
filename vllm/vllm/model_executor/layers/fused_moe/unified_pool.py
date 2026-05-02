@@ -303,13 +303,26 @@ class UnifiedPoolManager:
         """
         self.prefix_lru[block_id] = self.step
         self.prefix_lru.move_to_end(block_id, last=True)
+        if _trace_enabled():
+            print(
+                f"UNIFIED PREFIX_ADDED p{block_id} step={self.step} "
+                f"size={len(self.prefix_lru)}",
+                flush=True,
+            )
 
     def _on_prefix_removed(self, block_id: int) -> None:
         """The block stopped being an evictable cached-prefix entry —
         either ``touch`` pinned it for active use, or its hash was
         cleared. Either way, drop from the prefix-recency list.
         """
-        self.prefix_lru.pop(block_id, None)
+        removed = self.prefix_lru.pop(block_id, None)
+        if _trace_enabled():
+            was_present = "yes" if removed is not None else "no"
+            print(
+                f"UNIFIED PREFIX_REMOVED p{block_id} "
+                f"was_present={was_present} size={len(self.prefix_lru)}",
+                flush=True,
+            )
 
     # ------------------------------------------------------------------
     # Warm-up at Stage 2
