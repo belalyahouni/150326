@@ -475,8 +475,6 @@ class UnifiedPoolManager:
 
     def end_forward_step(self) -> None:
         self.step += 1
-        if self.step % 100 == 0:
-            self.log_stats()
 
     # ------------------------------------------------------------------
     # Victim selection — the plan's per-layer mixed LRU at query time.
