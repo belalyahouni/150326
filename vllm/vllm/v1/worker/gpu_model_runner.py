@@ -4594,6 +4594,17 @@ class GPUModelRunner(
                 for module in self.model.modules():
                     if isinstance(module, FusedMoE):
                         module._maybe_init_expert_cache()
+                # _maybe_init_expert_cache moves all experts to CPU pinned
+                # memory and allocates only cache_size slots back on GPU.
+                # Re-measure so the KV budget reflects the post-cache
+                # footprint instead of the pre-move all-experts peak —
+                # otherwise --expert-cache-size has no effect on the
+                # auto-computed KV-cache memory.
+                gc.collect()
+                post_cache_memory = current_platform.get_current_memory_usage(
+                    self.device
+                )
+                self.model_memory_usage = post_cache_memory - m.initial_memory
 
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
