@@ -62,15 +62,13 @@ Then **Ctrl-C the server** before Run A2.
 ```bash
 vllm serve allenai/OLMoE-1B-7B-0924-Instruct \
     --expert-offload \
-    --expert-cache-size 18 \
-    --num-gpu-blocks-override 5300 \
+    --expert-cache-size 64\
     --enable-prefix-caching \
     --enforce-eager \
     --trust-remote-code \
     --max-model-len 4096 \
     --max-num-batched-tokens 1 \
-    --gpu-memory-utilization 0.40 \
-    --disable-log-requests
+    --gpu-memory-utilization 0.35
 ```
 
 **Terminal B — client (same Scenario A workload, only output filename differs):**

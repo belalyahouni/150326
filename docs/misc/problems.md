@@ -20,3 +20,5 @@ blockpool lru confused with unfiedpool so not evicting free pages by default
 then only evicting free pages, doesnt consider experts, blockpool evicits expert instead of checjing unfieid pool lru.
 
 if we do some prefix, then still have random recomputation it kicks prefix out. we cant for rprefix to stay, but we should weigh up the recomputation cost isntead of straight steps.
+
+kv didnt reasize based on expert cache but on normal model size
