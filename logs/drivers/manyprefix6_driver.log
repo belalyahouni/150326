@@ -1,0 +1,8 @@
+=== 6-prefix unified test (pool=64 init=40) — latency (GPU0) + trace (GPU1) ===
+[ready] port=8000 after 17*2s
+[ready] port=8001 after 1*2s
+[g0] phase1 (cold) exit: 0
+[g1] phase1 trace exit: 0
+[g0] phase2 (warm) exit: 0
+[g1] phase2 trace exit: 0
+=== 6-prefix unified test done ===
