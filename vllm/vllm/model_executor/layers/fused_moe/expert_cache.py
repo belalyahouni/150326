@@ -157,7 +157,12 @@ class ExpertCache:
             evicted_expert_id = next(eviction_candidates)
             slot = self.expert_to_slot.pop(evicted_expert_id)
             del self.lru_order[evicted_expert_id]
-            print(f"ExpertCache: evict expert {evicted_expert_id} from slot {slot}, load expert {expert_id}", flush=True)
+            if _EXPERT_CACHE_TRACE:
+                print(
+                    f"ExpertCache: evict expert {evicted_expert_id} "
+                    f"from slot {slot}, load expert {expert_id}",
+                    flush=True,
+                )
 
             self.expert_to_slot[expert_id] = slot
             self.lru_order[expert_id] = None  # Add as MRU
