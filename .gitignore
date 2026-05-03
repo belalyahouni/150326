@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .env
 vllm-old/
+CLAUDE.md
+expert-cache-implementation.md
+todo.md

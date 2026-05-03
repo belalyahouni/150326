@@ -15,3 +15,4 @@
 
 **Instructions:**
 Always plan before implementing. Only implement when asked to. If anything goes not according to the plan during implmentation, do not push through, come back and plan again.
+Never add "Co-Authored-By: Claude" or any Claude attribution to commits, files, or anywhere in the repo.

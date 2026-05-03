@@ -42,36 +42,40 @@ Wires the config into CLI flags: `--expert-offload` and `--expert-cache-size`.
 
 Three changes to the `FusedMoE` class:
 
-**A. `__init__`** — After `create_weights` allocates expert tensors on GPU, moves them to CPU pinned RAM immediately. This frees GPU memory so the next layer can reuse it. Dense weights (attention, layernorm, router) are unaffected and stay on GPU.
+**A. `__init__`** — Stores `_expert_cache_size` from config. Does NOT move weights to CPU here — that would strip the `weight_loader` attribute that vLLM's weight loading system needs.
 
-**B. `_maybe_init_expert_cache`** — Called after all weights are loaded and post-processed. Creates the `ExpertCache` and warms it. By this point weights are in the format the kernel expects (any shuffling for AITER/FlashInfer has already been applied and the data moved back to CPU).
+**B. `_maybe_init_expert_cache`** — Called after all weights are loaded and post-processed (triggered from `gpu_model_runner.py`). Moves expert weights from GPU to CPU pinned RAM, then creates the `ExpertCache` and warms it. By this point weights are in the format the kernel expects.
 
 **C. `_forward_with_expert_cache`** — The forward pass with caching. Described in the workflow below.
+
+### 5. `gpu_model_runner.py` (MODIFIED) — Expert Cache Init Hook
+
+Added an explicit expert cache initialization loop after `prepare_communication_buffer_for_model` in `load_model()`. This iterates over all `FusedMoE` modules and calls `_maybe_init_expert_cache()`. Necessary because the normal init path (`maybe_init_modular_kernel`) only runs via EP communicators, which are absent on single-GPU setups. This runs after weights are loaded but before the profile/compile run.
 
 ---
 
 ## Complete Workflow
 
-### Setup: Mixtral 8x7B, BF16, cache_size=4
+### Setup: OLMoE-1B-7B, BF16, cache_size=8
 
-8 experts total per layer, 4 cached on GPU, 4 on CPU only.
+64 experts total per layer, 8 cached on GPU, 56 on CPU only.
 
 ### Model Loading
 
 ```
 For each MoE layer:
-  1. create_weights allocates w13[8,...] and w2[8,...] on GPU (empty)
-  2. Our code moves them to CPU pinned RAM, freeing GPU
-  3. Weight loader fills them from checkpoint (writes go to CPU)
-  4. Post-processing temporarily moves to GPU, transforms, moves back
-  5. ExpertCache created: allocates cache_w13[4,...] and cache_w2[4,...]
-     on GPU, copies experts 0-3 into them (warm cache)
+  1. create_weights allocates w13[64,...] and w2[64,...] on GPU (empty)
+  2. Weight loader fills them from checkpoint (on GPU, weight_loader intact)
+  3. After all weights loaded, gpu_model_runner calls _maybe_init_expert_cache:
+     a. Moves w13 and w2 from GPU to CPU pinned RAM
+     b. ExpertCache created: allocates cache_w13[8,...] and cache_w2[8,...]
+        on GPU, copies experts 0-7 into them (warm cache)
 ```
 
 After loading:
 ```
-CPU pinned RAM: all 8 experts per layer (source of truth)
-GPU: cache with experts 0,1,2,3 per layer + dense weights + KV cache
+CPU pinned RAM: all 64 experts per layer (source of truth)
+GPU: cache with experts 0-7 per layer + dense weights + KV cache
 ```
 
 ### Inference — Forward Pass
@@ -87,21 +91,19 @@ _forward_with_expert_cache(hidden_states, router_logits):
 
   3. ENSURE LOADED: expert_cache.ensure_experts_loaded([1, 5, 7])
        expert 1: in cache at slot 1  → HIT
-       expert 5: not in cache        → MISS → evict expert 0 (coldest),
-                                       DMA expert 5 into slot 0
-       expert 7: not in cache        → MISS → evict expert 2 (next coldest),
-                                       DMA expert 7 into slot 2
-       Wait for DMA to finish.
+       expert 5: in cache at slot 5  → HIT
+       expert 7: in cache at slot 7  → HIT
+       (all in warm cache, no DMA needed)
 
   4. REMAP IDs: topk_ids pointed to global expert IDs.
        The kernel needs to index into the cache buffers, so remap
-       to slot indices: expert 1→slot 1, expert 5→slot 0, expert 7→slot 2
-       remapped_ids = [[1],[0],[2]]
+       to slot indices: expert 1→slot 1, expert 5→slot 5, expert 7→slot 7
+       remapped_ids = [[1],[5],[7]]
 
   5. SWAP: temporarily replace layer attributes:
-       w13_weight.data = cache_w13 (the full [4,...] GPU buffer)
+       w13_weight.data = cache_w13 (the full [8,...] GPU buffer)
        w2_weight.data  = cache_w2
-       global_num_experts = 4  (cache_size, not 8)
+       global_num_experts = 8  (cache_size, not 64)
        expert_map = None
 
   6. KERNEL: quant_method.apply runs the MoE kernel.
@@ -115,18 +117,16 @@ _forward_with_expert_cache(hidden_states, router_logits):
   8. LRU UPDATE: mark experts 1, 5, 7 as most recently used.
 ```
 
-Cache state after:
+Later batch uses experts {1, 42, 63}:
 ```
-slot 0: expert 5  (was expert 0, evicted)
-slot 1: expert 1  (kept, was a hit)
-slot 2: expert 7  (was expert 2, evicted)
-slot 3: expert 3  (untouched)
+  expert 1:  in cache → HIT
+  expert 42: not in cache → MISS → evict expert 0 (coldest, LRU),
+             DMA expert 42 into slot 0
+  expert 63: not in cache → MISS → evict expert 2 (next coldest),
+             DMA expert 63 into slot 2
 
-lru_order (oldest → newest): [3, 1, 5, 7]
-Next eviction victim: expert 3
+  remapped_ids: expert 1→slot 1, expert 42→slot 0, expert 63→slot 2
 ```
-
-If the next batch also uses experts {1, 5, 7}: 100% cache hits, zero DMA.
 
 ### Why the Swap Works
 
@@ -134,18 +134,36 @@ The MoE kernel reads weights from `layer.w13_weight` and uses `layer.global_num_
 
 ---
 
+## Benchmarks (OLMoE-1B-7B, 5 prompts, 100 in / 100 out tokens, enforce-eager)
+
+| Config | TPOT (ms) | Output tok/s | TTFT (ms) |
+|---|---|---|---|
+| No offloading | 8.14 | 119.82 | 28.47 |
+| Expert cache 64 (all cached, no eviction) | 13.15 | 73.74 | 53.72 |
+| Expert cache 12 | 66.24 | 14.38 | 397.77 |
+| UVA offload all experts | 66.34 | 14.36 | 396.28 |
+
+**Observations:**
+- Cache-64 vs no offloading: ~60% overhead from Python-level remapping loop and attribute swapping, even with zero cache misses.
+- Cache-12 ≈ UVA offload: with only 12/64 experts cached and random prompts, nearly every step triggers cache misses and CPU→GPU DMA, bottlenecking on PCIe like UVA.
+- The LRU cache value shows on workloads with temporal locality (same experts reused across consecutive tokens/batches). Random prompts don't exhibit that.
+
 ## Current Limitations
 
+- **Requires `--enforce-eager`.** The expert cache forward path uses data-dependent ops (`unique().tolist()`) and attribute swapping that are incompatible with torch.compile/dynamo tracing.
+- **Prefill can exceed cache capacity.** During prefill, many tokens are processed at once (e.g., 100 tokens × top_k=8), activating most or all experts simultaneously. If the number of unique experts needed in a single batch exceeds `expert_cache_size`, the cache cannot hold them all and the engine crashes (`StopIteration`). **Workaround:** use `--max-num-batched-tokens N` where N is small enough that the unique experts per batch stay within `cache_size`. Setting `--max-num-batched-tokens 1` guarantees at most top_k experts per step (always fits), but makes prefill very slow. A proper fix would chunk the prefill tokens into sub-batches grouped by expert affinity.
 - **Unquantized models only.** Quantized models (FP8, FP4, GPTQ) have per-expert scale tensors that are not cached or remapped. The kernel would read wrong scales, producing silently incorrect results.
 - **No shared experts.** Models like DeepSeek-V3 have "shared experts" that run on every token. The cache path skips them entirely (`shared_experts_input=None`).
 - **Single GPU or tensor-parallel only.** No expert parallelism support.
-- **No CUDA graph support.** Cache misses trigger variable-length DMA which can't be captured in a graph.
+- **Remapping overhead.** The per-expert `for` loop doing `remapped_ids[topk_ids == global_id]` is O(num_unique_experts) full tensor scans. Could be replaced with a GPU-side lookup tensor.
 
 ## CLI Usage
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
-  --model mistralai/Mixtral-8x7B-Instruct-v0.1 \
+  --model allenai/OLMoE-1B-7B-0924 \
   --expert-offload \
-  --expert-cache-size 4
+  --expert-cache-size 12 \
+  --enforce-eager \
+  --max-num-batched-tokens 1
 ```
