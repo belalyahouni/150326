@@ -10,4 +10,30 @@ Starting main benchmark run...
 Traffic request rate: inf
 Burstiness factor: 1.0 (Poisson process)
 Maximum request concurrency: 1
-  0%|          | 0/8 [00:00<?, ?it/s] 12%|█▎        | 1/8 [00:09<01:03,  9.07s/it] 25%|██▌       | 2/8 [00:18<00:55,  9.20s/it] 38%|███▊      | 3/8 [00:27<00:45,  9.12s/it]
+  0%|          | 0/8 [00:00<?, ?it/s] 12%|█▎        | 1/8 [00:09<01:03,  9.07s/it] 25%|██▌       | 2/8 [00:18<00:55,  9.20s/it] 38%|███▊      | 3/8 [00:27<00:45,  9.12s/it] 50%|█████     | 4/8 [00:36<00:36,  9.08s/it] 62%|██████▎   | 5/8 [00:45<00:27,  9.01s/it] 75%|███████▌  | 6/8 [00:54<00:17,  8.95s/it] 88%|████████▊ | 7/8 [01:02<00:08,  8.89s/it]100%|██████████| 8/8 [01:11<00:00,  8.94s/it]100%|██████████| 8/8 [01:11<00:00,  8.99s/it]
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     8         
+Failed requests:                         0         
+Maximum request concurrency:             1         
+Benchmark duration (s):                  71.92     
+Total input tokens:                      2048      
+Total generated tokens:                  640       
+Request throughput (req/s):              0.11      
+Output token throughput (tok/s):         8.90      
+Peak output token throughput (tok/s):    43.00     
+Peak concurrent requests:                2.00      
+Total token throughput (tok/s):          37.38     
+---------------Time to First Token----------------
+Mean TTFT (ms):                          6929.32   
+Median TTFT (ms):                        6923.10   
+P99 TTFT (ms):                           7207.34   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          26.07     
+Median TPOT (ms):                        26.35     
+P99 TPOT (ms):                           26.91     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           26.07     
+Median ITL (ms):                         25.56     
+P99 ITL (ms):                            40.36     
+==================================================

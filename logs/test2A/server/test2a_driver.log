@@ -1,0 +1,38 @@
+=== 2A static cells ===
+  Phase 1 of round: prefix-tuned (cache=20, GPU0) + middle (cache=40, GPU1) ===
+[ready] port=8001 after 17*2s
+[ready] port=8000 after 17*2s
+[test2A_static_middle g1] phase1 exit: 0
+[test2A_static_prefix_tuned g0] phase1 exit: 0
+[test2A_static_middle g1] phase2 exit: 0
+[test2A_static_prefix_tuned g0] phase2 exit: 0
+  Phase 2 of round: expert-tuned (cache=64, GPU0) ===
+[ready] port=8000 after 17*2s
+[test2A_static_expert_tuned g0] phase1 exit: 0
+[test2A_static_expert_tuned g0] phase2 exit: 0
+=== 2A static cells done ===
+=== 2A unified-from-middle (cache=40 init) — latency (GPU0) + trace (GPU1) ===
+[ready] port=8001 after 17*2s
+[ready] port=8000 after 17*2s
+[test2A_unified_from_middle g0] phase1 exit: 0
+[test2A_unified_from_middle g1] phase1 exit: 0
+[test2A_unified_from_middle g0] phase2 exit: 0
+[test2A_unified_from_middle g1] phase2 exit: 0
+=== 2A unified-from-middle done ===
+=== 2A unified-from-prefix (cache=20 init, ablation) — latency (GPU0) + trace (GPU1) ===
+[ready] port=8000 after 17*2s
+[ready] port=8001 after 18*2s
+[test2A_unified_from_prefix g0] phase1 exit: 0
+[test2A_unified_from_prefix g1] phase1 exit: 0
+[test2A_unified_from_prefix g0] phase2 exit: 0
+[test2A_unified_from_prefix g1] phase2 exit: 0
+=== 2A unified-from-prefix done ===
+=== 2A unified-from-expert (cache=64 init, ablation) — latency (GPU0) + trace (GPU1) ===
+[ready] port=8001 after 17*2s
+[ready] port=8000 after 18*2s
+[test2A_unified_from_expert g0] phase1 exit: 0
+[test2A_unified_from_expert g1] phase1 exit: 0
+[test2A_unified_from_expert g0] phase2 exit: 0
+[test2A_unified_from_expert g1] phase2 exit: 0
+=== 2A unified-from-expert done ===
+=== Test 2A complete ===

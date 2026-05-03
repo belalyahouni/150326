@@ -113,3 +113,18 @@
 (APIServer pid=3574756) INFO 05-03 18:09:51 [loggers.py:259] Engine 000: Avg prompt throughput: 25.6 tokens/s, Avg generation throughput: 8.0 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 2.0%, Prefix cache hit rate: 0.0%
 (APIServer pid=3574756) INFO:     127.0.0.1:37784 - "POST /v1/completions HTTP/1.1" 200 OK
 (APIServer pid=3574756) INFO 05-03 18:10:01 [loggers.py:259] Engine 000: Avg prompt throughput: 25.6 tokens/s, Avg generation throughput: 8.0 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 2.0%, Prefix cache hit rate: 0.0%
+(APIServer pid=3574756) INFO:     127.0.0.1:37784 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3574756) INFO 05-03 18:10:11 [loggers.py:259] Engine 000: Avg prompt throughput: 51.2 tokens/s, Avg generation throughput: 10.7 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 2.0%, Prefix cache hit rate: 0.0%
+(APIServer pid=3574756) INFO:     127.0.0.1:37784 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3574756) INFO 05-03 18:10:21 [loggers.py:259] Engine 000: Avg prompt throughput: 25.6 tokens/s, Avg generation throughput: 12.3 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 2.0%, Prefix cache hit rate: 0.0%
+(APIServer pid=3574756) INFO:     127.0.0.1:37784 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3574756) INFO:     127.0.0.1:37784 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3574756) INFO 05-03 18:10:31 [loggers.py:259] Engine 000: Avg prompt throughput: 25.6 tokens/s, Avg generation throughput: 9.0 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 2.0%, Prefix cache hit rate: 0.0%
+(APIServer pid=3574756) INFO:     127.0.0.1:37784 - "GET /metrics HTTP/1.1" 200 OK
+(EngineCore pid=3575418) INFO 05-03 18:10:40 [core.py:1215] Shutdown initiated (timeout=0)
+(EngineCore pid=3575418) INFO 05-03 18:10:40 [core.py:1238] Shutdown complete
+(APIServer pid=3574756) INFO:     Shutting down
+[rank0]:[W503 18:10:40.920695629 ProcessGroupNCCL.cpp:1553] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+(APIServer pid=3574756) INFO:     Waiting for application shutdown.
+(APIServer pid=3574756) INFO:     Application shutdown complete.
+(APIServer pid=3574756) INFO:     Finished server process [3574756]

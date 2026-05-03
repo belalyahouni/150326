@@ -1,0 +1,5 @@
+=== Unified comparison: workload A (5 prompts, cache=64 init) — latency (GPU0) + trace (GPU1) ===
+[ready] port=8000 after 17*2s
+[ready] port=8001 after 1*2s
+[unified 1A] bench exits: latency=0 trace=0
+=== Unified comparison done ===

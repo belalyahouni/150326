@@ -118,3 +118,11 @@
 (APIServer pid=3574758) INFO:     127.0.0.1:33422 - "POST /v1/completions HTTP/1.1" 200 OK
 (APIServer pid=3574758) INFO:     127.0.0.1:33422 - "GET /metrics HTTP/1.1" 200 OK
 (APIServer pid=3574758) INFO 05-03 18:10:01 [loggers.py:259] Engine 000: Avg prompt throughput: 51.2 tokens/s, Avg generation throughput: 16.0 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%
+(APIServer pid=3574758) INFO 05-03 18:10:11 [loggers.py:259] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 0.0 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%
+(EngineCore pid=3575300) INFO 05-03 18:10:43 [core.py:1215] Shutdown initiated (timeout=0)
+(EngineCore pid=3575300) INFO 05-03 18:10:43 [core.py:1238] Shutdown complete
+(APIServer pid=3574758) INFO:     Shutting down
+(APIServer pid=3574758) INFO:     Waiting for application shutdown.
+(APIServer pid=3574758) INFO:     Application shutdown complete.
+(APIServer pid=3574758) INFO:     Finished server process [3574758]
+[rank0]:[W503 18:10:43.997867266 ProcessGroupNCCL.cpp:1553] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())

@@ -1,0 +1,33 @@
+=== Sweep round: cache=8 (GPU0) + cache=16 (GPU1) ===
+[ready] port=8000 after 17*2s
+[ready] port=8001 after 17*2s
+[cache=16 g1] 1A exit: 0
+[cache=8 g0] 1A exit: 0
+[cache=16 g1] 1B exit: 0
+[cache=8 g0] 1B exit: 0
+=== Sweep round done ===
+=== Sweep round: cache=24 (GPU0) + cache=32 (GPU1) ===
+[ready] port=8001 after 17*2s
+[ready] port=8000 after 17*2s
+[cache=32 g1] 1A exit: 0
+[cache=24 g0] 1A exit: 0
+[cache=32 g1] 1B exit: 0
+[cache=24 g0] 1B exit: 0
+=== Sweep round done ===
+=== Sweep round: cache=40 (GPU0) + cache=48 (GPU1) ===
+[ready] port=8001 after 17*2s
+[ready] port=8000 after 18*2s
+[cache=48 g1] 1A exit: 0
+[cache=40 g0] 1A exit: 0
+[cache=48 g1] 1B exit: 0
+[cache=40 g0] 1B exit: 0
+=== Sweep round done ===
+=== Sweep round: cache=56 (GPU0) + cache=64 (GPU1) ===
+[ready] port=8000 after 17*2s
+[ready] port=8001 after 18*2s
+[cache=56 g0] 1A exit: 0
+[cache=56 g0] 1B exit: 0
+[cache=64 g1] 1A exit: 0
+[cache=64 g1] 1B exit: 0
+=== Sweep round done ===
+=== Static sweep complete ===

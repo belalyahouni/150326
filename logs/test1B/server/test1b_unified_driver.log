@@ -1,0 +1,6 @@
+=== 1B Round unified: latency (GPU0) + trace (GPU1, lvl=1) ===
+[ready] port=8000 after 17*2s
+[ready] port=8001 after 1*2s
+[1B-unified] bench exits: latency=0 trace=0
+=== 1B Round unified done ===
+=== Test 1B complete ===
