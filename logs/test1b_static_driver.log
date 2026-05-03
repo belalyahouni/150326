@@ -1,0 +1,3 @@
+=== 1B Round static: 1B-static-bad (GPU0, cache=16) + 1B-static-good (GPU1, cache=64) ===
+[ready] port=8000 after 17*2s
+[ready] port=8001 after 1*2s

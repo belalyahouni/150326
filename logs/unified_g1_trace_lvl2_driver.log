@@ -1,0 +1,3 @@
+[ready] port=8001 after 17*2s
+[unified_g1_trace] bench exit: 0
+=== unified_g1_trace done ===

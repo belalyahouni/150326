@@ -19,6 +19,8 @@ VLLM_UNIFIED_POOL_TRACE=1 vllm serve allenai/OLMoE-1B-7B-0924-Instruct \
     --max-num-batched-tokens 1 \
     --max-model-len 4096 \
     --num-gpu-blocks-override 16 \
+    --attention-backend TRITON_ATTN \
+    --no-async-scheduling \
     &> /tmp/prefix_lru_test_2.log
 ```
 

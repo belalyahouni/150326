@@ -15,3 +15,8 @@ choice:
 1 expert LRU and adjsut existing vllm kv lru (in blockpool and outside of blockpool)
 
 after phase 1 reaslied that k and v are actually split and so messes up the paging system
+
+blockpool lru confused with unfiedpool so not evicting free pages by default
+then only evicting free pages, doesnt consider experts, blockpool evicits expert instead of checjing unfieid pool lru.
+
+if we do some prefix, then still have random recomputation it kicks prefix out. we cant for rprefix to stay, but we should weigh up the recomputation cost isntead of straight steps.

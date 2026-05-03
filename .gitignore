@@ -1,5 +1,9 @@
 venv/
+venv-mvp/
+venv-phase-2/
 __pycache__/
 *.pyc
 .env
 vllm-old/
+logs/test1A_unified_from_bad_seed1_g1_trace_lvl2.log
+logs/old/test1A_unified_from_bad_seed1_g1_trace_blocks65_lvl2_with_suffix.log

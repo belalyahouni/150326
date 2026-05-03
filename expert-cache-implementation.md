@@ -134,6 +134,26 @@ The MoE kernel reads weights from `layer.w13_weight` and uses `layer.global_num_
 
 ---
 
+## Per-step trace logging
+
+`ExpertCache.ensure_experts_loaded` can emit a per-call diagnostic line of the form:
+
+```
+ExpertCache: needed=[4, 6, 30, 34, 43, 44, 46, 59] hits=[4, 6, 30, 34, 43, 44, 46, 59] misses=[]
+```
+
+This fires once per layer per forward step, so on `--max-num-batched-tokens 1` it produces tens of thousands of lines per request. **Off by default** to keep latency-sensitive runs clean.
+
+Enable with:
+
+```bash
+VLLM_EXPERT_CACHE_TRACE=1 vllm serve ...
+```
+
+The flag is resolved once at module import (`expert_cache.py:18-25`) and stored in the module-level `_EXPERT_CACHE_TRACE` constant. The gate at the print site is therefore a single attribute read — when the flag is unset the cost is effectively zero per call (no `os.environ` lookup in the hot path).
+
+This flag is independent of `VLLM_UNIFIED_POOL_TRACE`. Expert-cache and unified-pool are mutually exclusive offload backends; only one is active at a time. Leave both unset for any timed/benchmark run; enable the relevant one only when you need the per-step trace for diagnosis.
+
 ## Current Limitations
 
 - **Unquantized models only.** Quantized models (FP8, FP4, GPTQ) have per-expert scale tensors that are not cached or remapped. The kernel would read wrong scales, producing silently incorrect results.

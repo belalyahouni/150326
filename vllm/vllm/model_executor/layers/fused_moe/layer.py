@@ -734,6 +734,8 @@ class FusedMoE(CustomOp):
         """
         if self._expert_cache is not None or self._expert_cache_size <= 0:
             return
+        if self._unified_pool_enabled:
+            return
         if not hasattr(self, "w13_weight") or not hasattr(self, "w2_weight"):
             return
 
