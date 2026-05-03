@@ -197,6 +197,15 @@ class BlockPool:
         self._on_prefix_added_callbacks: list[Callable[[int], None]] = []
         self._on_prefix_removed_callbacks: list[Callable[[int], None]] = []
 
+        # Optional KV victim selector for unified-pool integration.
+        # When set, ``get_new_blocks`` delegates victim choice to this
+        # callback (which returns N already-dequeued blocks) instead of
+        # doing a naive ``popleft_n`` on the free queue. Lets the
+        # unified pool route KV allocations through its own LRU-based
+        # Tier-1/Tier-2 selection, rather than blindly taking whatever
+        # is at the queue front. None for non-unified-pool deployments.
+        self._kv_victim_selector: Callable[[int], list[KVCacheBlock]] | None = None
+
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -348,7 +357,10 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if self._kv_victim_selector is not None:
+            ret: list[KVCacheBlock] = self._kv_victim_selector(num_blocks)
+        else:
+            ret = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -374,6 +386,23 @@ class BlockPool:
             for cb in self._on_allocation_callbacks:
                 cb(block_ids)
         return ret
+
+    def register_kv_victim_selector(
+        self, callback: Callable[[int], list[KVCacheBlock]]
+    ) -> None:
+        """Route KV-allocation victim choice through ``callback``.
+
+        Once set, ``get_new_blocks(n)`` delegates to ``callback(n)``
+        instead of ``free_block_queue.popleft_n(n)``. The callback
+        must return exactly ``n`` blocks already removed from the
+        free queue. Post-selection housekeeping in ``get_new_blocks``
+        (hash clearing via ``_maybe_evict_cached_block``, ref-count,
+        on-allocation listeners) runs unchanged on whatever the
+        callback returns. Used by the unified pool to route KV
+        demand through its LRU-based victim selector. Idempotent
+        replacement; only one selector is supported.
+        """
+        self._kv_victim_selector = callback
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """

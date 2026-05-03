@@ -14,12 +14,18 @@ per-layer from global expert ids to block_ids (via ``block_id_at``), and
 No staging tensor, no GPU->GPU gather, no extra GPU memory beyond the pool.
 """
 
+from __future__ import annotations
+
 import os
 from collections import OrderedDict
+from typing import TYPE_CHECKING
 
 import torch
 
 from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
 logger = init_logger(__name__)
 
@@ -269,6 +275,16 @@ class UnifiedPoolManager:
         self.block_pool.register_on_prefix_added_callback(self._on_prefix_added)
         self.block_pool.register_on_prefix_removed_callback(
             self._on_prefix_removed
+        )
+        # Route KV victim selection through unified-pool LRUs (replaces
+        # standard ``popleft_n``). Tier 1 picks a truly-free block (no
+        # prefix hash, no expert mapping in any layer); Tier 2 LRU-
+        # compares oldest expert across all layers vs oldest prefix
+        # and takes the colder. Mirrors ``_select_victim_block`` for
+        # the KV side, closing the asymmetry that previously let KV
+        # demand cannibalise prefix or arbitrarily evict experts.
+        self.block_pool.register_kv_victim_selector(
+            self._select_kv_victim_blocks
         )
 
     def register_layer(self, layer: UnifiedPool) -> None:
@@ -709,6 +725,149 @@ class UnifiedPoolManager:
             "resolving expert miss. No pure-free block, no evictable "
             "expert, and no evictable prefix entry. Reduce "
             "--max-num-batched-tokens or increase --num-gpu-blocks-override."
+        )
+
+    # ------------------------------------------------------------------
+    # KV victim selection — symmetric counterpart of _select_victim_block
+    # but for KV-allocation demand (no specific layer of origin).
+    # ------------------------------------------------------------------
+
+    def _any_layer_pins(self, block_id: int) -> bool:
+        """True if any registered layer currently pins ``block_id``."""
+        for layer in self.layers.values():
+            if block_id in layer.pinned_blocks:
+                return True
+        return False
+
+    def _oldest_global_expert(
+        self,
+    ) -> tuple[int | None, int | None]:
+        """Return (block_id, step) of the globally LRU-oldest expert
+        across all layers, or (None, None) if no evictable expert
+        exists. Skips experts whose blocks are pinned by any layer.
+        """
+        best_step: int | None = None
+        best_block: int | None = None
+        for layer in self.layers.values():
+            for eid, step in layer.expert_lru.items():
+                block_id = layer.block_at_expert.get(eid)
+                if block_id is None:
+                    continue
+                if self._any_layer_pins(block_id):
+                    continue
+                if best_step is None or step < best_step:
+                    best_step = step
+                    best_block = block_id
+                # Inner LRU is ordered oldest-first; the first
+                # non-pinned entry is this layer's contribution. No
+                # need to keep scanning further into this layer.
+                break
+        return best_block, best_step
+
+    def _select_kv_victim_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+        """Pick ``num_blocks`` victims for KV allocation.
+
+        Two-tier selection mirroring ``_select_victim_block`` for the
+        expert path:
+
+        1. **Tier 1 — truly free.** Walk the free queue front-to-back.
+           Take the first block with no prefix hash AND no expert
+           mapping in any layer AND not pinned. Cost = 0.
+        2. **Tier 2 — LRU compare.** Otherwise compare oldest expert
+           (across all layers' ``expert_lru`` tails) vs oldest prefix
+           (``prefix_lru`` head). Take whichever has smaller step.
+
+        Each returned block is already removed from the free queue.
+        Post-selection housekeeping in ``BlockPool.get_new_blocks``
+        (hash clearing, ``_on_kv_allocation`` broadcast that drops
+        any expert mappings on the chosen blocks) runs unchanged.
+        Called once per ``get_new_blocks`` request, picks N blocks.
+        """
+        if num_blocks == 0:
+            return []
+        queue = self.block_pool.free_block_queue
+        ret: list[KVCacheBlock] = []
+        for _ in range(num_blocks):
+            block = self._pick_one_kv_victim()
+            ret.append(block)
+        # Sanity: all picked blocks left the queue and got their
+        # bookkeeping kept consistent.
+        assert queue.num_free_blocks >= 0
+        return ret
+
+    def _pick_one_kv_victim(self) -> KVCacheBlock:
+        """Pick one victim block for KV. Removes from free queue."""
+        queue = self.block_pool.free_block_queue
+
+        # Tier 1: truly free — no hash, no expert mapping, not pinned.
+        cursor = queue.fake_free_list_head.next_free_block
+        while cursor is not None and cursor is not queue.fake_free_list_tail:
+            nxt = cursor.next_free_block
+            block_id = cursor.block_id
+            if cursor.block_hash is not None:
+                cursor = nxt
+                continue
+            if self.block_holder.get(block_id):
+                cursor = nxt
+                continue
+            if self._any_layer_pins(block_id):
+                cursor = nxt
+                continue
+            queue.remove(cursor)
+            if _trace_enabled():
+                print(
+                    f"UNIFIED KV_CLAIM page={block_id} tier=truly-free",
+                    flush=True,
+                )
+            return cursor
+
+        # Tier 2: LRU compare oldest expert vs oldest prefix.
+        oldest_expert_bid, oldest_expert_step = self._oldest_global_expert()
+
+        oldest_prefix_bid: int | None = None
+        oldest_prefix_step: int | None = None
+        for block_id, step in self.prefix_lru.items():
+            if self._any_layer_pins(block_id):
+                continue
+            oldest_prefix_bid = block_id
+            oldest_prefix_step = step
+            break
+
+        chosen_block_id: int | None = None
+        chosen_tier: str | None = None
+        if oldest_expert_bid is not None and oldest_prefix_bid is not None:
+            assert oldest_expert_step is not None
+            assert oldest_prefix_step is not None
+            if oldest_expert_step <= oldest_prefix_step:
+                chosen_block_id = oldest_expert_bid
+                chosen_tier = "kv-evicts-expert"
+            else:
+                chosen_block_id = oldest_prefix_bid
+                chosen_tier = "kv-evicts-prefix"
+        elif oldest_expert_bid is not None:
+            chosen_block_id = oldest_expert_bid
+            chosen_tier = "kv-evicts-expert"
+        elif oldest_prefix_bid is not None:
+            chosen_block_id = oldest_prefix_bid
+            chosen_tier = "kv-evicts-prefix"
+
+        if chosen_block_id is not None:
+            assert chosen_tier is not None
+            block = self.block_pool.blocks[chosen_block_id]
+            queue.remove(block)
+            if _trace_enabled():
+                print(
+                    f"UNIFIED KV_CLAIM page={chosen_block_id} "
+                    f"tier={chosen_tier}",
+                    flush=True,
+                )
+            return block
+
+        raise RuntimeError(
+            "UnifiedPool: pool exhausted resolving KV allocation. "
+            "No truly-free block, no evictable expert, no evictable "
+            "prefix entry. Reduce --max-num-batched-tokens or "
+            "increase --num-gpu-blocks-override."
         )
 
     # ------------------------------------------------------------------
