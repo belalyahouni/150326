@@ -30,8 +30,30 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+# Trace level resolved once at module load — gates fire ~48k times per
+# request at --max-num-batched-tokens 1, so per-call os.environ.get()
+# was a measurable latency tax even when trace was off.
+#
+# Levels:
+#   "0" / unset  → off; gate is a single attribute read.
+#   "1"          → essential lines only (CACHE composition + EVICT +
+#                  KV_CLAIM + PREFIX_ADDED/REMOVED). Enough for the
+#                  dissertation overlay figure and tier-count tables.
+#   "2"          → also enable per-step diagnostics (STEP header,
+#                  EXPERT_LRU dump, PREFIX_LRU snapshot, REQUEST list,
+#                  RESULT, free-tier CLAIM lines). Useful for
+#                  debugging; do not use for latency-sensitive runs.
+_TRACE_LEVEL = os.environ.get("VLLM_UNIFIED_POOL_TRACE", "0")
+_TRACE_ENABLED = _TRACE_LEVEL in ("1", "2")
+_TRACE_VERBOSE = _TRACE_LEVEL == "2"
+
+
 def _trace_enabled() -> bool:
-    return os.environ.get("VLLM_UNIFIED_POOL_TRACE", "0") == "1"
+    return _TRACE_ENABLED
+
+
+def _trace_verbose() -> bool:
+    return _TRACE_VERBOSE
 
 
 def move_experts_to_cpu(
@@ -574,9 +596,10 @@ class UnifiedPoolManager:
             block, tier = self._select_victim_block(layer, needed_set)
             block_id = block.block_id
             cause = f"expert-L{layer.layer_idx}"
-            if _trace_enabled() and tier.startswith("free"):
+            if _TRACE_VERBOSE and tier.startswith("free"):
                 # Tier 1 free-claim has no eviction line; emit a CLAIM
                 # so the trace still shows where each miss landed.
+                # Verbose-only: counts come from EVICT lines anyway.
                 print(
                     f"UNIFIED CLAIM page={block_id} L{layer.layer_idx} "
                     f"E{eid} cause={cause} tier={tier}",
@@ -591,7 +614,7 @@ class UnifiedPoolManager:
             miss_assignments.append((eid, block_id, tier))
             self.block_pool.free_block_queue.append(block)
 
-        if _trace_enabled():
+        if _TRACE_VERBOSE:
             hit_parts = [f"E{eid}@p{bid}" for eid, bid in hit_results]
             miss_parts = [
                 f"E{eid}->p{bid}({tier})"
@@ -904,9 +927,15 @@ class UnifiedPoolManager:
     def _trace_pre_mutation(
         self, layer: UnifiedPool, needed_expert_ids: list[int]
     ) -> None:
-        """Emit the per-step header, per-layer pool composition, both
-        LRU orderings (MRU→LRU), and the router's request — all
-        captured BEFORE any state mutation in ``ensure_loaded``.
+        """Emit per-layer pool composition (essential, level≥1), and at
+        verbose level (2) the per-step header, both LRU orderings, and
+        the router's request — all captured BEFORE any state mutation
+        in ``ensure_loaded``.
+
+        ``UNIFIED CACHE`` includes ``step={self.step}`` so each line
+        is self-contained for downstream parsers (the dissertation
+        overlay figure aligns CACHE snapshots to per-request bench
+        timestamps via this step counter).
         """
         capacity = len(self.block_pool.blocks)
         n_expert_ours = len(layer.expert_at_block)
@@ -930,17 +959,23 @@ class UnifiedPoolManager:
             - n_held_other
         )
 
+        # Essential — needed for the overlay figure.
         print(
-            f"=== STEP {self.step} L{layer.layer_idx} "
-            f"need={needed_expert_ids} ===",
-            flush=True,
-        )
-        print(
-            f"UNIFIED CACHE L{layer.layer_idx} "
+            f"UNIFIED CACHE L{layer.layer_idx} step={self.step} "
             f"occ {n_expert_ours}/{capacity} ours "
             f"(expert-ours={n_expert_ours}, expert-other={n_held_other}, "
             f"prefix={n_prefix}, alloc-kv={n_alloc_kv}, "
             f"pinned={n_pinned}, free-pure={n_free_pure})",
+            flush=True,
+        )
+
+        if not _TRACE_VERBOSE:
+            return
+
+        # Verbose — per-step diagnostics.
+        print(
+            f"=== STEP {self.step} L{layer.layer_idx} "
+            f"need={needed_expert_ids} ===",
             flush=True,
         )
 

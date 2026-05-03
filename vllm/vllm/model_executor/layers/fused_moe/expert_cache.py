@@ -7,6 +7,7 @@ All experts permanently live on CPU pinned RAM. The GPU has a small cache
 we DMA-copy from CPU pinned → GPU, evicting the LRU expert's replica.
 """
 
+import os
 from collections import OrderedDict
 
 import torch
@@ -14,6 +15,16 @@ import torch
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+# Trace gate resolved once at module load — the per-step print fires
+# per layer per forward step so a per-call ``os.environ.get`` was a
+# measurable latency tax on the static expert-offload path. Enable
+# with ``VLLM_EXPERT_CACHE_TRACE=1`` only when the trace is actually
+# wanted (e.g. for diagnosing routing); leave unset for any timed
+# run.
+_EXPERT_CACHE_TRACE = (
+    os.environ.get("VLLM_EXPERT_CACHE_TRACE", "0") == "1"
+)
 
 
 class ExpertCache:
@@ -123,7 +134,12 @@ class ExpertCache:
                 self.misses += 1
                 missing_expert_ids.append(expert_id)
 
-        print(f"ExpertCache: needed={needed_expert_ids} hits={hit_ids} misses={missing_expert_ids}", flush=True)
+        if _EXPERT_CACHE_TRACE:
+            print(
+                f"ExpertCache: needed={needed_expert_ids} "
+                f"hits={hit_ids} misses={missing_expert_ids}",
+                flush=True,
+            )
 
         if not missing_expert_ids:
             return
