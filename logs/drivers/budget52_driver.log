@@ -1,0 +1,19 @@
+
+############################################
+### Budget M=52 (static splits: (16,36)/(24,28)/(40,12); unified init=26)
+############################################
+=== Round 1: static cache=16 (GPU0) + static cache=24 (GPU1) ===
+[ready] port=8001 after 16*2s
+[ready] port=8000 after 17*2s
+[budget52_static_C24 g1] phase1 exit: 0
+[budget52_static_C16 g0] phase1 exit: 0
+[budget52_static_C24 g1] phase2 exit: 0
+[budget52_static_C16 g0] phase2 exit: 0
+=== Round 2: static cache=40 (GPU0) + unified pool=52 (GPU1) ===
+[ready] port=8001 after 17*2s
+[ready] port=8000 after 18*2s
+[budget52_static_C40 g0] phase1 exit: 0
+[budget52_unified_init26 g1] phase1 exit: 0
+[budget52_static_C40 g0] phase2 exit: 0
+[budget52_unified_init26 g1] phase2 exit: 0
+=== Budget M=52 done ===

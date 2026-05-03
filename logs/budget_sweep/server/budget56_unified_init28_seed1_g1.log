@@ -1,0 +1,122 @@
+(APIServer pid=3726568) INFO 05-03 20:57:22 [utils.py:297] 
+(APIServer pid=3726568) INFO 05-03 20:57:22 [utils.py:297]        █     █     █▄   ▄█
+(APIServer pid=3726568) INFO 05-03 20:57:22 [utils.py:297]  ▄▄ ▄█ █     █     █ ▀▄▀ █  version 0.0.1
+(APIServer pid=3726568) INFO 05-03 20:57:22 [utils.py:297]   █▄█▀ █     █     █     █  model   allenai/OLMoE-1B-7B-0924-Instruct
+(APIServer pid=3726568) INFO 05-03 20:57:22 [utils.py:297]    ▀▀  ▀▀▀▀▀ ▀▀▀▀▀ ▀     ▀
+(APIServer pid=3726568) INFO 05-03 20:57:22 [utils.py:297] 
+(APIServer pid=3726568) INFO 05-03 20:57:22 [utils.py:233] non-default args: {'model_tag': 'allenai/OLMoE-1B-7B-0924-Instruct', 'port': 8001, 'model': 'allenai/OLMoE-1B-7B-0924-Instruct', 'trust_remote_code': True, 'max_model_len': 4096, 'enforce_eager': True, 'attention_backend': 'TRITON_ATTN', 'block_size': 1536, 'num_gpu_blocks_override': 56, 'enable_prefix_caching': True, 'expert_offload': True, 'expert_cache_size': 28, 'expert_unified_pool': True, 'max_num_batched_tokens': 1, 'async_scheduling': False}
+(APIServer pid=3726568) INFO 05-03 20:57:23 [model.py:533] Resolved architecture: OlmoeForCausalLM
+(APIServer pid=3726568) INFO 05-03 20:57:23 [model.py:1582] Using max model len 4096
+(APIServer pid=3726568) INFO 05-03 20:57:23 [scheduler.py:231] Chunked prefill is enabled with max_num_batched_tokens=1.
+(APIServer pid=3726568) INFO 05-03 20:57:23 [vllm.py:754] Asynchronous scheduling is disabled.
+(APIServer pid=3726568) WARNING 05-03 20:57:23 [vllm.py:788] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+(APIServer pid=3726568) WARNING 05-03 20:57:23 [vllm.py:799] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+(APIServer pid=3726568) INFO 05-03 20:57:23 [vllm.py:964] Cudagraph is disabled under eager mode
+(APIServer pid=3726568) INFO 05-03 20:57:23 [compilation.py:289] Enabled custom fusions: norm_quant, act_quant
+(EngineCore pid=3727203) INFO 05-03 20:57:28 [core.py:103] Initializing a V1 LLM engine (v0.0.1) with config: model='allenai/OLMoE-1B-7B-0924-Instruct', speculative_config=None, tokenizer='allenai/OLMoE-1B-7B-0924-Instruct', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=4096, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False), seed=0, served_model_name=allenai/OLMoE-1B-7B-0924-Instruct, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all'], 'splitting_ops': [], 'compile_mm_encoder': False, 'compile_sizes': [], 'compile_ranges_endpoints': [1], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': True, 'static_all_moe_layers': []}
+(EngineCore pid=3727203) INFO 05-03 20:57:28 [parallel_state.py:1395] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://192.168.10.105:53497 backend=nccl
+(EngineCore pid=3727203) INFO 05-03 20:57:28 [parallel_state.py:1717] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+(EngineCore pid=3727203) INFO 05-03 20:57:29 [gpu_model_runner.py:4492] Starting to load model allenai/OLMoE-1B-7B-0924-Instruct...
+(EngineCore pid=3727203) INFO 05-03 20:57:29 [cuda.py:257] Using AttentionBackendEnum.TRITON_ATTN backend.
+(EngineCore pid=3727203) INFO 05-03 20:57:29 [unquantized.py:186] Using TRITON backend for Unquantized MoE
+(EngineCore pid=3727203) Loading safetensors checkpoint shards:   0% Completed | 0/3 [00:00<?, ?it/s]
+(EngineCore pid=3727203) Loading safetensors checkpoint shards:  33% Completed | 1/3 [00:00<00:01,  1.38it/s]
+(EngineCore pid=3727203) Loading safetensors checkpoint shards:  67% Completed | 2/3 [00:01<00:00,  1.25it/s]
+(EngineCore pid=3727203) Loading safetensors checkpoint shards: 100% Completed | 3/3 [00:02<00:00,  1.36it/s]
+(EngineCore pid=3727203) Loading safetensors checkpoint shards: 100% Completed | 3/3 [00:02<00:00,  1.34it/s]
+(EngineCore pid=3727203) 
+(EngineCore pid=3727203) INFO 05-03 20:57:34 [default_loader.py:314] Loading weights took 2.31 seconds
+(EngineCore pid=3727203) INFO 05-03 20:57:35 [gpu_model_runner.py:4577] Model loading took 12.89 GiB memory and 5.725841 seconds
+(EngineCore pid=3727203) INFO 05-03 20:57:45 [gpu_model_runner.py:6762] UnifiedPool Stage 1 (Phase 2): 16 MoE layers, expert_slot=12582912 B, bytes/token=8192, block_size: 1536 -> 1536 tokens. No staging tensor — kernel reads pool buffer directly.
+(EngineCore pid=3727203) WARNING 05-03 20:57:45 [fused_moe.py:1093] Using default MoE config. Performance might be sub-optimal! Config file not found at /home/belal/150326/venv-phase-2/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/configs/E=64,N=1024,device_name=NVIDIA_L40.json
+(EngineCore pid=3727203) INFO 05-03 20:57:46 [gpu_worker.py:452] Available KV cache memory: 26.93 GiB
+(EngineCore pid=3727203) INFO 05-03 20:57:46 [kv_cache_utils.py:826] Overriding num_gpu_blocks=143 with num_gpu_blocks_override=56
+(EngineCore pid=3727203) INFO 05-03 20:57:46 [kv_cache_utils.py:1316] GPU KV cache size: 86,016 tokens
+(EngineCore pid=3727203) INFO 05-03 20:57:46 [kv_cache_utils.py:1321] Maximum concurrency for 4,096 tokens per request: 18.67x
+(EngineCore pid=3727203) INFO 05-03 20:57:46 [core.py:295] init engine (profile, create kv cache, warmup model) took 1.26 seconds
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [unified_pool.py:514] UnifiedPool L0: warmed 28/64 experts
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [unified_pool.py:514] UnifiedPool L1: warmed 28/64 experts
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [unified_pool.py:514] UnifiedPool L2: warmed 28/64 experts
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [unified_pool.py:514] UnifiedPool L3: warmed 28/64 experts
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [unified_pool.py:514] UnifiedPool L4: warmed 28/64 experts
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [unified_pool.py:514] UnifiedPool L5: warmed 28/64 experts
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [unified_pool.py:514] UnifiedPool L6: warmed 28/64 experts
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [unified_pool.py:514] UnifiedPool L7: warmed 28/64 experts
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [unified_pool.py:514] UnifiedPool L8: warmed 28/64 experts
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [unified_pool.py:514] UnifiedPool L9: warmed 28/64 experts
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [unified_pool.py:514] UnifiedPool L10: warmed 28/64 experts
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [unified_pool.py:514] UnifiedPool L11: warmed 28/64 experts
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [unified_pool.py:514] UnifiedPool L12: warmed 28/64 experts
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [unified_pool.py:514] UnifiedPool L13: warmed 28/64 experts
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [unified_pool.py:514] UnifiedPool L14: warmed 28/64 experts
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [unified_pool.py:514] UnifiedPool L15: warmed 28/64 experts
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [unified_pool.py:544] UnifiedPool warm-up sanity check passed: 448 (expert, block) pairs verified across 16 layers.
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [gpu_model_runner.py:6899] UnifiedPool Stage 2 complete: 16 layers, warm_count=28, num_gpu_blocks=56
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [vllm.py:754] Asynchronous scheduling is disabled.
+(EngineCore pid=3727203) WARNING 05-03 20:57:47 [vllm.py:788] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+(EngineCore pid=3727203) WARNING 05-03 20:57:47 [vllm.py:799] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [vllm.py:964] Cudagraph is disabled under eager mode
+(EngineCore pid=3727203) INFO 05-03 20:57:47 [compilation.py:289] Enabled custom fusions: norm_quant, act_quant
+(APIServer pid=3726568) INFO 05-03 20:57:47 [api_server.py:573] Supported tasks: ['generate']
+(APIServer pid=3726568) INFO 05-03 20:57:49 [hf.py:320] Detected the chat template content format to be 'string'. You can set `--chat-template-content-format` to override this.
+(APIServer pid=3726568) INFO 05-03 20:57:50 [api_server.py:577] Starting vLLM server on http://0.0.0.0:8001
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:37] Available routes are:
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /openapi.json, Methods: HEAD, GET
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /docs, Methods: HEAD, GET
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /docs/oauth2-redirect, Methods: HEAD, GET
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /redoc, Methods: HEAD, GET
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /tokenize, Methods: POST
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /detokenize, Methods: POST
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /load, Methods: GET
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /version, Methods: GET
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /health, Methods: GET
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /metrics, Methods: GET
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /v1/models, Methods: GET
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /ping, Methods: GET
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /ping, Methods: POST
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /invocations, Methods: POST
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /v1/chat/completions, Methods: POST
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /v1/responses, Methods: POST
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /v1/responses/{response_id}, Methods: GET
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /v1/responses/{response_id}/cancel, Methods: POST
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /v1/completions, Methods: POST
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /v1/messages, Methods: POST
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /v1/messages/count_tokens, Methods: POST
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /inference/v1/generate, Methods: POST
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /scale_elastic_ep, Methods: POST
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /is_scaling_elastic_ep, Methods: POST
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /v1/chat/completions/render, Methods: POST
+(APIServer pid=3726568) INFO 05-03 20:57:50 [launcher.py:46] Route: /v1/completions/render, Methods: POST
+(APIServer pid=3726568) INFO:     Started server process [3726568]
+(APIServer pid=3726568) INFO:     Waiting for application startup.
+(APIServer pid=3726568) INFO:     Application startup complete.
+(APIServer pid=3726568) INFO:     127.0.0.1:55306 - "GET /v1/models HTTP/1.1" 200 OK
+(APIServer pid=3726568) INFO:     127.0.0.1:43372 - "POST /v1/completions HTTP/1.1" 200 OK
+(EngineCore pid=3727203) WARNING 05-03 20:58:00 [fused_moe.py:1093] Using default MoE config. Performance might be sub-optimal! Config file not found at /home/belal/150326/venv-phase-2/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/configs/E=56,N=1024,device_name=NVIDIA_L40.json
+(APIServer pid=3726568) INFO:     127.0.0.1:43372 - "GET /metrics HTTP/1.1" 200 OK
+(APIServer pid=3726568) INFO:     127.0.0.1:43372 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3726568) INFO:     127.0.0.1:43372 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3726568) INFO 05-03 20:58:40 [loggers.py:259] Engine 000: Avg prompt throughput: 307.4 tokens/s, Avg generation throughput: 3.4 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 1.8%, Prefix cache hit rate: 33.3%
+(APIServer pid=3726568) INFO 05-03 20:58:50 [loggers.py:259] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 0.0 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 1.8%, Prefix cache hit rate: 33.3%
+(APIServer pid=3726568) INFO:     127.0.0.1:43372 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3726568) INFO:     127.0.0.1:43372 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3726568) INFO:     127.0.0.1:43372 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3726568) INFO:     127.0.0.1:43372 - "GET /metrics HTTP/1.1" 200 OK
+(APIServer pid=3726568) INFO 05-03 20:59:20 [loggers.py:259] Engine 000: Avg prompt throughput: 307.6 tokens/s, Avg generation throughput: 8.0 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 66.6%
+(APIServer pid=3726568) INFO:     127.0.0.1:32906 - "GET /metrics HTTP/1.1" 200 OK
+(APIServer pid=3726568) INFO:     127.0.0.1:32906 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3726568) INFO:     127.0.0.1:32906 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3726568) INFO:     127.0.0.1:32906 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3726568) INFO 05-03 20:59:30 [loggers.py:259] Engine 000: Avg prompt throughput: 51.2 tokens/s, Avg generation throughput: 16.0 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 1.8%, Prefix cache hit rate: 64.0%
+(APIServer pid=3726568) INFO:     127.0.0.1:32906 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3726568) INFO:     127.0.0.1:32906 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3726568) INFO 05-03 20:59:40 [loggers.py:259] Engine 000: Avg prompt throughput: 51.2 tokens/s, Avg generation throughput: 16.0 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 1.8%, Prefix cache hit rate: 62.3%
+(APIServer pid=3726568) INFO:     127.0.0.1:32906 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3726568) INFO:     127.0.0.1:32906 - "GET /metrics HTTP/1.1" 200 OK
+(EngineCore pid=3727203) INFO 05-03 20:59:46 [core.py:1215] Shutdown initiated (timeout=0)
+(EngineCore pid=3727203) INFO 05-03 20:59:46 [core.py:1238] Shutdown complete
+(APIServer pid=3726568) INFO:     Shutting down
+[rank0]:[W503 20:59:46.162715709 ProcessGroupNCCL.cpp:1553] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+(APIServer pid=3726568) INFO:     Waiting for application shutdown.
+(APIServer pid=3726568) INFO:     Application shutdown complete.
+(APIServer pid=3726568) INFO:     Finished server process [3726568]

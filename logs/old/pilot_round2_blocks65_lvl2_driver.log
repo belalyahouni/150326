@@ -1,6 +1,0 @@
-=== Round 2: 1A-unified-from-bad latency (GPU0) + trace (GPU1) ===
-[ready] port=8000 after 18*2s
-[ready] port=8001 after 1*2s
-[round2] bench exits: latency=0 trace=0
-=== Round 2 done ===
-=== Pilot complete ===

@@ -1,9 +1,7 @@
-venv/
-venv-mvp/
-venv-phase-2/
+venv*/
 __pycache__/
 *.pyc
 .env
 vllm-old/
-**/*_trace_lvl2.log
-logs/old/test1A_unified_from_bad_seed1_g1_trace_blocks65_lvl2_with_suffix.log
+# Per-step pool-composition trace dumps are too large for git; regenerable from runs.
+**/*_trace*.log

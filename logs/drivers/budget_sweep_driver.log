@@ -1,0 +1,91 @@
+
+############################################
+### Budget M=16  (static splits: (8,8)/(12,4); unified init=8)
+############################################
+=== Round 1: static cache=8 (GPU0) + static cache=12 (GPU1) ===
+[ready] port=8000 after 17*2s
+[ready] port=8001 after 17*2s
+[budget16_static_C8 g0] phase1 exit: 0
+[budget16_static_C8 g0] phase2 exit: 0
+[budget16_static_C12 g1] phase1 exit: 0
+[budget16_static_C12 g1] phase2 exit: 0
+=== Round 2: unified pool=16 (GPU0) ===
+[ready] port=8000 after 17*2s
+[budget16_unified_init8 g0] phase1 exit: 0
+[budget16_unified_init8 g0] phase2 exit: 0
+=== Budget M=16 done ===
+
+############################################
+### Budget M=24  (static splits: (8,16)/(12,12)/(16,8); unified init=12)
+############################################
+=== Round 1: static cache=8 (GPU0) + static cache=12 (GPU1) ===
+[ready] port=8001 after 17*2s
+[ready] port=8000 after 18*2s
+[budget24_static_C12 g1] phase1 exit: 0
+[budget24_static_C8 g0] phase1 exit: 0
+[budget24_static_C12 g1] phase2 exit: 0
+[budget24_static_C8 g0] phase2 exit: 0
+=== Round 2: static cache=16 (GPU0) + unified pool=24 (GPU1) ===
+[ready] port=8001 after 17*2s
+[ready] port=8000 after 17*2s
+[budget24_static_C16 g0] phase1 exit: 0
+[budget24_static_C16 g0] phase2 exit: 0
+[budget24_unified_init12 g1] phase1 exit: 0
+[budget24_unified_init12 g1] phase2 exit: 0
+=== Budget M=24 done ===
+
+############################################
+### Budget M=32  (static splits: (8,24)/(16,16)/(24,8); unified init=16)
+############################################
+=== Round 1: static cache=8 (GPU0) + static cache=16 (GPU1) ===
+[ready] port=8000 after 17*2s
+[ready] port=8001 after 17*2s
+[budget32_static_C16 g1] phase1 exit: 0
+[budget32_static_C8 g0] phase1 exit: 0
+[budget32_static_C16 g1] phase2 exit: 0
+[budget32_static_C8 g0] phase2 exit: 0
+=== Round 2: static cache=24 (GPU0) + unified pool=32 (GPU1) ===
+[ready] port=8001 after 17*2s
+[ready] port=8000 after 18*2s
+[budget32_static_C24 g0] phase1 exit: 0
+[budget32_static_C24 g0] phase2 exit: 0
+[budget32_unified_init16 g1] phase1 exit: 0
+[budget32_unified_init16 g1] phase2 exit: 0
+=== Budget M=32 done ===
+
+############################################
+### Budget M=48  (static splits: (16,32)/(24,24)/(40,8); unified init=24)
+############################################
+=== Round 1: static cache=16 (GPU0) + static cache=24 (GPU1) ===
+[ready] port=8001 after 17*2s
+[ready] port=8000 after 17*2s
+[budget48_static_C16 g0] phase1 exit: 0
+[budget48_static_C24 g1] phase1 exit: 0
+[budget48_static_C24 g1] phase2 exit: 0
+[budget48_static_C16 g0] phase2 exit: 0
+=== Round 2: static cache=40 (GPU0) + unified pool=48 (GPU1) ===
+[ready] port=8000 after 17*2s
+[ready] port=8001 after 18*2s
+[budget48_static_C40 g0] phase1 exit: 0
+[budget48_static_C40 g0] phase2 exit: 0
+[budget48_unified_init24 g1] phase1 exit: 0
+[budget48_unified_init24 g1] phase2 exit: 0
+=== Budget M=48 done ===
+
+############################################
+### Budget M=64  (static splits: (20,44)/(40,24)/(64,0); unified init=40)
+############################################
+=== Round 1: static cache=20 (GPU0) + static cache=40 (GPU1) ===
+[ready] port=8000 after 17*2s
+[ready] port=8001 after 17*2s
+[budget64_static_C40 g1] phase1 exit: 0
+[budget64_static_C20 g0] phase1 exit: 0
+[budget64_static_C40 g1] phase2 exit: 0
+[budget64_static_C20 g0] phase2 exit: 0
+=== Round 2: static cache=64 (GPU0) + unified pool=64 (GPU1) ===
+[ready] port=8001 after 16*2s
+[dead] server pid=3716369 port=8000
+[budget64_unified_init40 g1] phase1 exit: 0
+[budget64_unified_init40 g1] phase2 exit: 0
+=== Budget M=64 done ===
+=== Memory-budget sweep complete ===

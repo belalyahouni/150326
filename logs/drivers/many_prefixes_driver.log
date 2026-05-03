@@ -1,0 +1,10 @@
+=== Many-prefixes test at M=64 ===
+  Round 1: static C=20 (GPU0) + static C=40 (GPU1) ===
+[ready] port=8000 after 17*2s
+[ready] port=8001 after 17*2s
+[manyprefix_static_C20 g0] phase1 (cold) exit: 0
+[manyprefix_static_C40 g1] phase1 (cold) exit: 0
+[manyprefix_static_C20 g0] phase2 (warm) exit: 0
+[manyprefix_static_C40 g1] phase2 (warm) exit: 0
+  Round 2: static C=60 (GPU0) + unified pool=64 (GPU1) ===
+[ready] port=8000 after 1*2s
