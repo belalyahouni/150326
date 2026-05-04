@@ -6,7 +6,9 @@ LOGS=$ROOT/logs
 RESULTS=$ROOT/results
 VLLM=$ROOT/venv-phase-2/bin/vllm
 MODEL=allenai/OLMoE-1B-7B-0924-Instruct
-PROMPTS=$ROOT/prompts/alternating_prompts.jsonl
+PROMPTS_FWD=$ROOT/prompts/repeat_prompts.jsonl
+PROMPTS_REV=$ROOT/prompts/repeat_prompts_reverse.jsonl
+NUM_PROMPTS=30
 
 mkdir -p "$LOGS" "$RESULTS"
 
@@ -37,14 +39,26 @@ wait_for_server() {
   echo "[timeout] port=$port"; return 1
 }
 
-run_workload_A() {
+run_workload_A_warm() {
   local port=$1 cache=$2
   "$VLLM" bench serve --backend vllm --host 127.0.0.1 --port $port \
     --endpoint /v1/completions --model "$MODEL" \
-    --dataset-name custom --dataset-path "$PROMPTS" \
+    --dataset-name custom --dataset-path "$PROMPTS_FWD" \
     --disable-shuffle --skip-chat-template \
-    --custom-output-len 20 --num-prompts 5 \
-    --max-concurrency 1 --num-warmups 1 --seed $SEED \
+    --custom-output-len 20 --num-prompts $NUM_PROMPTS \
+    --max-concurrency 1 --seed $SEED \
+    --result-filename "$RESULTS/sweep_static_cache${cache}_1A_warm_seed${SEED}.json" \
+    --save-result --trust-remote-code
+}
+
+run_workload_A_measure() {
+  local port=$1 cache=$2
+  "$VLLM" bench serve --backend vllm --host 127.0.0.1 --port $port \
+    --endpoint /v1/completions --model "$MODEL" \
+    --dataset-name custom --dataset-path "$PROMPTS_REV" \
+    --disable-shuffle --skip-chat-template \
+    --custom-output-len 20 --num-prompts $NUM_PROMPTS \
+    --max-concurrency 1 --seed $SEED \
     --result-filename "$RESULTS/sweep_static_cache${cache}_1A_seed${SEED}.json" \
     --save-result --trust-remote-code
 }
@@ -79,10 +93,10 @@ run_cell() {
   local PID
   PID=$(start_static $gpu $port $cache)
   wait_for_server $port $PID || { shutdown $PID; return 1; }
-  run_workload_A $port $cache > "$LOGS/bench_sweep_static_cache${cache}_1A_g${gpu}.log" 2>&1
-  echo "[cache=$cache g$gpu] 1A exit: $?"
-  run_workload_B $port $cache > "$LOGS/bench_sweep_static_cache${cache}_1B_g${gpu}.log" 2>&1
-  echo "[cache=$cache g$gpu] 1B exit: $?"
+  run_workload_A_warm $port $cache > "$LOGS/bench_sweep_static_cache${cache}_1A_warm_g${gpu}.log" 2>&1
+  echo "[cache=$cache g$gpu] 1A warm exit: $?"
+  run_workload_A_measure $port $cache > "$LOGS/bench_sweep_static_cache${cache}_1A_g${gpu}.log" 2>&1
+  echo "[cache=$cache g$gpu] 1A measure exit: $?"
   shutdown $PID
 }
 
