@@ -341,6 +341,9 @@ only request-level variation is which of the two prefixes is sent.
 | 1A-static-bad | 64 | no | `results/test1A_static_bad_seed{N}.json` |
 | 1A-static-good | 20 | no | `results/test1A_static_good_seed{N}.json` |
 | 1A-unified-from-bad | 64 (initial only) | **yes** | `results/test1A_unified_from_bad_seed{N}.json` |
+| 1A-vanilla *(upper bound)* | n/a (no offload) | n/a | `results/test1A_vanilla_seed{N}.json` |
+
+The **vanilla** cell drops `--expert-offload` entirely (no `--expert-cache-size`, no `--expert-unified-pool`, no `--num-gpu-blocks-override`) and uses `--gpu-memory-utilization 0.85` so all 64 experts stay resident in VRAM. This **breaks the shared-budget invariant** (steady-state ~38–39 GB vs. ~14 GB for static/unified) and is reported as a no-offload upper bound only — it is *not* an apples-to-apples cell. Single seed is sufficient since the cell has no LRU state and no eviction policy to perturb.
 
 Bench command (same for all three cells, only output filename differs):
 
@@ -384,6 +387,9 @@ steady-state segment.
 | 1B-static-bad | 16 | no | `results/test1B_static_bad_seed{N}.json` |
 | 1B-static-good | 64 | no | `results/test1B_static_good_seed{N}.json` |
 | 1B-unified-from-bad | 16 (initial only) | **yes** | `results/test1B_unified_from_bad_seed{N}.json` |
+| 1B-vanilla *(upper bound)* | n/a (no offload) | n/a | `results/test1B_vanilla_seed{N}.json` |
+
+Same configuration as the 1A vanilla cell — see the note above 1A's table. Single-seed upper bound; not budget-matched.
 
 Bench:
 
@@ -415,8 +421,24 @@ into cold experts; KV is dead weight under this workload and gets evicted.
 ### Test 1 total runs
 - Static cells (4 of 6) × 3 seeds × 1 pass = 12 server boots.
 - Unified cells (2 of 6) × 3 seeds × 2 passes (latency + trace) = 12 server boots.
-- **Total: 24 server boots, 24 bench calls** (only latency-pass bench JSONs are
+- Vanilla cells (2 of 8) × 1 seed × 1 pass = 2 server boots (parallelisable on the two GPUs).
+- **Total: 26 server boots, 26 bench calls** (only latency-pass bench JSONs are
   retained; trace-pass bench output is discarded).
+
+### Vanilla baseline — seed 1 results
+
+Run via `scripts/run_vanilla_baseline.sh` (driver log: `logs/drivers/vanilla_baseline_driver.log`). Both cells launched in parallel, one per GPU; idle VRAM was 38.9 GB on each GPU, vs. ~14 GB for the budget-matched cells.
+
+| Cell | Mean TTFT (ms) | Median TTFT (ms) | Mean TPOT (ms) |
+|---|---:|---:|---:|
+| 1A-vanilla | 1556 | 36 | 9.82 |
+| 1A-unified-from-bad (seed 1) | 1813 | 40 | 11.50 |
+| 1A-static-good (seed 1) | 2033 | 48 | 17.71 |
+| 1B-vanilla | 2592 | 2593 | 10.06 |
+| 1B-unified-from-bad (seed 1) | 3051 | 3044 | 11.83 |
+| 1B-static-good (seed 1) | 3319 | 3296 | 12.98 |
+
+Vanilla is the lowest-TPOT cell on both tests, as expected (no expert DMAs). Unified-from-bad sits within ~17% of vanilla on 1A TPOT and ~18% on 1B TPOT — i.e., the unified pool recovers most of the no-offload speed at ~1/3 the VRAM. Static-good lags vanilla by ~80% (1A) and ~29% (1B) TPOT.
 
 ---
 
