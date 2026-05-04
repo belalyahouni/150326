@@ -342,8 +342,11 @@ only request-level variation is which of the two prefixes is sent.
 | 1A-static-good | 20 | no | `results/test1A_static_good_seed{N}.json` |
 | 1A-unified-from-bad | 64 (initial only) | **yes** | `results/test1A_unified_from_bad_seed{N}.json` |
 | 1A-vanilla *(upper bound)* | n/a (no offload) | n/a | `results/test1A_vanilla_seed{N}.json` |
+| 1A-vanilla-matched *(starved)* | n/a (no offload) | n/a | `results/test1A_vanilla_matched_seed{N}.json` |
 
-The **vanilla** cell drops `--expert-offload` entirely (no `--expert-cache-size`, no `--expert-unified-pool`, no `--num-gpu-blocks-override`) and uses `--gpu-memory-utilization 0.85` so all 64 experts stay resident in VRAM. This **breaks the shared-budget invariant** (steady-state ~38–39 GB vs. ~14 GB for static/unified) and is reported as a no-offload upper bound only — it is *not* an apples-to-apples cell. Single seed is sufficient since the cell has no LRU state and no eviction policy to perturb.
+The **vanilla (upper bound)** cell drops `--expert-offload` entirely (no `--expert-cache-size`, no `--expert-unified-pool`, no `--num-gpu-blocks-override`) and uses `--gpu-memory-utilization 0.85` so all 64 experts stay resident in VRAM. This **breaks the shared-budget invariant** (steady-state ~38–39 GB vs. ~14 GB for static/unified) and is reported as a no-offload upper bound only — it is *not* an apples-to-apples cell. Single seed is sufficient since the cell has no LRU state and no eviction policy to perturb.
+
+The **vanilla-matched (starved)** cell is the same vanilla configuration but at `--gpu-memory-utilization 0.3105` — the same matched budget the static cells use. Block size stays at 1536. With all 64 experts resident in the model's own weights (~14 GB), the residual KV budget is **6,144 tokens = 4 blocks** at block-size 1536 — barely enough to serve a single max-len request, far too small to hold both 3,072-token alternating prefixes in cache simultaneously. This makes 1A a recompute-every-other-request workload and is the apples-to-apples "no offload, no cheating on memory" baseline. Single seed.
 
 Bench command (same for all three cells, only output filename differs):
 
@@ -388,8 +391,9 @@ steady-state segment.
 | 1B-static-good | 64 | no | `results/test1B_static_good_seed{N}.json` |
 | 1B-unified-from-bad | 16 (initial only) | **yes** | `results/test1B_unified_from_bad_seed{N}.json` |
 | 1B-vanilla *(upper bound)* | n/a (no offload) | n/a | `results/test1B_vanilla_seed{N}.json` |
+| 1B-vanilla-matched *(starved)* | n/a (no offload) | n/a | `results/test1B_vanilla_matched_seed{N}.json` |
 
-Same configuration as the 1A vanilla cell — see the note above 1A's table. Single-seed upper bound; not budget-matched.
+Same vanilla configurations as the 1A cells — see the notes above 1A's table. The matched-budget cell is interesting in 1B mainly as a *negative* result: 1B's prompts are 256 tokens (= 1 KV block) with no shared prefixes, so KV starvation does not hurt this workload — the prefix cache is irrelevant. Used to demonstrate that the matched-budget vanilla's collapse on 1A is specifically a prefix-cache-starvation effect, not a generic latency hit. Single-seed.
 
 Bench:
 
@@ -421,24 +425,30 @@ into cold experts; KV is dead weight under this workload and gets evicted.
 ### Test 1 total runs
 - Static cells (4 of 6) × 3 seeds × 1 pass = 12 server boots.
 - Unified cells (2 of 6) × 3 seeds × 2 passes (latency + trace) = 12 server boots.
-- Vanilla cells (2 of 8) × 1 seed × 1 pass = 2 server boots (parallelisable on the two GPUs).
-- **Total: 26 server boots, 26 bench calls** (only latency-pass bench JSONs are
+- Vanilla cells (4 of 10) × 1 seed × 1 pass = 4 server boots (parallelisable two-by-two on the two GPUs).
+- **Total: 28 server boots, 28 bench calls** (only latency-pass bench JSONs are
   retained; trace-pass bench output is discarded).
 
-### Vanilla baseline — seed 1 results
+### Vanilla baselines — seed 1 results
 
-Run via `scripts/run_vanilla_baseline.sh` (driver log: `logs/drivers/vanilla_baseline_driver.log`). Both cells launched in parallel, one per GPU; idle VRAM was 38.9 GB on each GPU, vs. ~14 GB for the budget-matched cells.
+Two vanilla cells per test:
+- **vanilla (upper bound)**: `scripts/run_vanilla_baseline.sh` at `--gpu-memory-utilization 0.85`. Idle VRAM ~38.9 GB. Driver log: `logs/drivers/vanilla_baseline_driver.log`.
+- **vanilla-matched (starved)**: `scripts/run_vanilla_matched.sh` at `--gpu-memory-utilization 0.3105` (same as static). Idle VRAM 14.6 GB on each GPU — matches static/unified. KV size auto-sized to 6,144 tokens = 4 blocks at block_size 1536. Driver log: `logs/drivers/vanilla_matched_driver.log`.
 
 | Cell | Mean TTFT (ms) | Median TTFT (ms) | Mean TPOT (ms) |
 |---|---:|---:|---:|
-| 1A-vanilla | 1556 | 36 | 9.82 |
-| 1A-unified-from-bad (seed 1) | 1813 | 40 | 11.50 |
-| 1A-static-good (seed 1) | 2033 | 48 | 17.71 |
-| 1B-vanilla | 2592 | 2593 | 10.06 |
-| 1B-unified-from-bad (seed 1) | 3051 | 3044 | 11.83 |
-| 1B-static-good (seed 1) | 3319 | 3296 | 12.98 |
+| 1A-vanilla *(upper bound, ~39 GB)* | 1556 | 36 | 9.82 |
+| 1A-unified-from-bad *(~14 GB)* | 1813 | 40 | 11.50 |
+| 1A-static-good *(~14 GB)* | 2033 | 48 | 17.71 |
+| **1A-vanilla-matched** *(~14 GB, KV-starved)* | **29,176** | **30,651** | 9.90 |
+| 1B-vanilla *(upper bound, ~39 GB)* | 2592 | 2593 | 10.06 |
+| 1B-vanilla-matched *(~14 GB)* | 2625 | 2585 | 10.19 |
+| 1B-unified-from-bad *(~14 GB)* | 3051 | 3044 | 11.83 |
+| 1B-static-good *(~14 GB)* | 3319 | 3296 | 12.98 |
 
-Vanilla is the lowest-TPOT cell on both tests, as expected (no expert DMAs). Unified-from-bad sits within ~17% of vanilla on 1A TPOT and ~18% on 1B TPOT — i.e., the unified pool recovers most of the no-offload speed at ~1/3 the VRAM. Static-good lags vanilla by ~80% (1A) and ~29% (1B) TPOT.
+**Read of the headline contrasts:**
+- *Upper bound vs. budget-matched cells.* Vanilla (~39 GB) is the lowest-TPOT cell on both tests — no expert DMAs at all. Unified-from-bad sits within ~17% of it on 1A TPOT and ~18% on 1B TPOT, i.e., the unified pool recovers most of the no-offload speed at ~1/3 the VRAM. Static-good lags vanilla by ~80% (1A) and ~29% (1B) TPOT.
+- *Vanilla-matched vs. budget-matched cells (apples-to-apples).* On **1A**, the matched-budget vanilla is **catastrophic**: TTFT mean 29.2 s (vs. 1.8 s for unified, 2.0 s for static-good). With block-size 1536, the matched 14 GB budget leaves only 4 KV blocks, which cannot hold both 3,072-token prefixes plus a serving block — so prefix-cache hit rate is ~33% and most requests are full re-prefills. On **1B**, the matched vanilla is **fine** (TTFT 2.63 s, indistinguishable from the upper bound) because random 256-token prompts share no prefix and don't need cache. This is the apples-to-apples evidence that *expert offload is what enables a useful KV/prefix-cache budget at this VRAM target* — without it, prefix-heavy workloads collapse even though decode-only workloads are unaffected.
 
 ---
 

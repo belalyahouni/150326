@@ -1,0 +1,5 @@
+=== Vanilla MATCHED-BUDGET: 1A (GPU0) + 1B (GPU1), gpu-mem-util=0.3105 ===
+[ready] port=8000 after 12*2s
+[ready] port=8001 after 1*2s
+[vanilla-matched] bench exits: 1A=0 1B=0
+=== Vanilla MATCHED-BUDGET done ===
