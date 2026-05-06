@@ -35,7 +35,3 @@ The exact commands and flags for each test are in the matching `scripts/run_*.sh
 - `--expert-cache-size N`: number of expert slots per layer.
 - `--expert-unified-pool`: use the unified pool (only on the phase-2 and phase-3 branches).
 - `VLLM_UNIFIED_POOL_TRACE=1`: emit the per-step pool trace.
-
-## Notes
-
-This is a research prototype written for an academic project. It is not meant as a general purpose inference framework.
