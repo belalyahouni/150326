@@ -4587,8 +4587,8 @@ class GPUModelRunner(
             ):
                 prepare_communication_buffer_for_model(drafter_model)
 
-            # Initialize expert caches for MoE layers after weights are loaded.
-            # This must happen before profile_run / torch.compile tracing.
+            # Build expert caches once weights are loaded, before profile_run
+            # and any torch.compile tracing.
             if self.vllm_config.offload_config.expert_offload:
                 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
                 if self.vllm_config.offload_config.expert_unified_pool:
@@ -4597,12 +4597,10 @@ class GPUModelRunner(
                     for module in self.model.modules():
                         if isinstance(module, FusedMoE):
                             module._maybe_init_expert_cache()
-                    # _maybe_init_expert_cache moves all experts to CPU pinned
-                    # memory and allocates only cache_size slots back on GPU.
-                    # Re-measure so the KV budget reflects the post-cache
-                    # footprint instead of the pre-move all-experts peak —
-                    # otherwise --expert-cache-size has no effect on the
-                    # auto-computed KV-cache memory.
+                    # Most expert weights now live on CPU, so the recorded
+                    # model footprint is too high. Re-measure so the auto
+                    # KV budget actually shrinks when --expert-cache-size
+                    # is small.
                     gc.collect()
                     post_cache_memory = (
                         current_platform.get_current_memory_usage(self.device)
@@ -6563,22 +6561,15 @@ class GPUModelRunner(
                 return gid
         return 0
 
-    # ------------------------------------------------------------------
-    # Unified-pool MVP setup (two stages)
-    # ------------------------------------------------------------------
+    # Unified-pool MVP setup (two stages).
 
     def _assert_attention_backend_kv_layout(self) -> None:
-        # The pool aliases each layer's KV byte tensor and treats the
-        # linear view as num_gpu_blocks contiguous pages of
-        # page_size_bytes. That math only matches reality when each
-        # logical block's K and V are contiguous in memory — i.e. the
-        # backend's KV cache shape is (num_blocks, 2, ...). FlashAttn
-        # uses (2, num_blocks, ...) which puts all K's first then all
-        # V's; pool page b then physically straddles K bytes for two
-        # unrelated scheduler blocks and expert DMAs corrupt live KV,
-        # which manifests as garbage attention reads (the MoE side is
-        # unaffected because Phase 1 reads from staging). Fail fast at
-        # startup.
+        # The pool views each layer's KV byte tensor as num_gpu_blocks
+        # contiguous pages, which only works if K and V for one block
+        # sit next to each other (shape (num_blocks, 2, ...)). FlashAttn
+        # uses (2, num_blocks, ...), so a single pool page would straddle
+        # K bytes from two unrelated scheduler blocks and expert copies
+        # would silently corrupt live KV. Fail at startup instead.
         from vllm.model_executor.layers.attention_layer_base import (
             AttentionLayerBase,
         )
@@ -6608,22 +6599,20 @@ class GPUModelRunner(
                     f"attention reads. Pass "
                     f"--attention-backend TRITON_ATTN."
                 )
-            break  # one layer is enough; all attention groups share a backend
+            break  # all attention groups share the same backend
 
     def _unified_pool_stage1(self) -> None:
         """Stage 1 of unified-pool init.
 
-        Runs before the memory profile and KV-cache allocation:
-        - For each ``FusedMoE`` module: pin experts to CPU and allocate
-          per-layer staging tensors on GPU. The staging is allocated
-          here so the profiler subtracts it from the budget reported
-          to the scheduler (per plan §3).
-        - Derive ``block_size_tokens`` so a KV page exactly equals one
-          expert slot's bytes. Mutate ``cache_config.block_size``.
+        Runs before profiling and KV cache allocation. For each FusedMoE
+        module it pins the experts to CPU and allocates the per-layer
+        staging tensor (allocating here makes the profiler count it
+        against the model footprint). It also picks a block_size_tokens
+        so one KV page equals one expert slot's bytes and writes that
+        back to cache_config.block_size.
         """
         from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 
-        # Validate constraints up front.
         parallel_config = self.vllm_config.parallel_config
         if parallel_config.tensor_parallel_size != 1:
             raise ValueError(
@@ -6670,8 +6659,8 @@ class GPUModelRunner(
                 "FusedMoE modules."
             )
 
-        # All MoE layers must have the same expert slot size for the
-        # alias to work (single uniform page size across layers).
+        # The pool uses one page size for every layer, so every MoE
+        # layer must have the same expert slot size.
         first = moe_metas[0]
         for meta in moe_metas[1:]:
             if meta["expert_slot_bytes"] != first["expert_slot_bytes"]:
@@ -6681,7 +6670,7 @@ class GPUModelRunner(
                     % (meta["expert_slot_bytes"], first["expert_slot_bytes"])
                 )
 
-        # Derive block_size_tokens from the first attention layer's spec.
+        # Use the first attention layer's spec to size each block.
         kv_specs = self.get_kv_cache_spec()
         if not kv_specs:
             raise ValueError(
@@ -6693,7 +6682,7 @@ class GPUModelRunner(
                 "--expert-unified-pool: only models with AttentionSpec KV "
                 "cache layers are supported (got %s)." % type(sample_spec)
             )
-        # Phase 1 MVP requires uniform attention-only KV cache.
+        # MVP supports only uniform attention KV cache.
         for layer_name, spec in kv_specs.items():
             if not isinstance(spec, AttentionSpec):
                 raise ValueError(
@@ -6739,10 +6728,9 @@ class GPUModelRunner(
 
         old_block_size = self.cache_config.block_size
         self.cache_config.block_size = block_size_tokens
-        # Re-cache on the runner so downstream code uses the new size.
+        # Update the cached copy on the runner too.
         self.block_size = block_size_tokens
-        # Mark as user-specified so downstream auto-tuning doesn't
-        # override it (e.g. update_block_size_for_backend).
+        # Pin the value so update_block_size_for_backend doesn't overwrite it.
         self.cache_config.user_specified_block_size = True
 
         total_staging_bytes = sum(
@@ -6772,22 +6760,17 @@ class GPUModelRunner(
     def _unified_pool_capture_raw_kv(
         self, kv_cache_raw_tensors: dict[str, torch.Tensor]
     ) -> None:
-        """Stage 2 helper: snapshot raw KV byte tensors after they are
-        allocated by ``_allocate_kv_cache_tensors``. Called from
-        ``initialize_kv_cache_tensors``.
-        """
+        """Snapshot the raw KV byte tensors right after they're allocated."""
         self._unified_pool_kv_cache_raw_tensors = dict(kv_cache_raw_tensors)
 
     def setup_unified_pool(self, block_pool) -> int:
         """Stage 2 of unified-pool init (RPC entry point).
 
-        Construct per-layer ``UnifiedPool`` objects aliasing each
-        layer's KV byte tensor as the pool buffer, register the
-        cross-layer KV-allocation callback on ``BlockPool``, and warm
-        the first ``expert_cache_size`` experts per layer.
-
-        Returns the number of GPU blocks the pool sees (after the
-        BlockPool's reserved null block).
+        Builds a per-layer UnifiedPool that aliases each layer's KV
+        byte tensor as the pool buffer, hooks the cross-layer KV
+        allocation callback on BlockPool, and warms the first
+        expert_cache_size experts per layer. Returns the GPU block
+        count the pool sees (after the null block).
         """
         from vllm.model_executor.layers.attention_layer_base import (
             AttentionLayerBase,
@@ -6808,7 +6791,7 @@ class GPUModelRunner(
                 "were allocated."
             )
 
-        # Build attention-layer-index → KV byte tensor map.
+        # Map attention layer index -> raw KV byte tensor.
         attn_layers: dict[int, torch.Tensor] = {}
         for layer_name, attn_module in (
             self.compilation_config.static_forward_context.items()
@@ -6839,13 +6822,10 @@ class GPUModelRunner(
                     f"KV: {sorted(attn_layers)}"
                 )
             raw_kv = attn_layers[layer_idx]
-            # vLLM sizes the per-layer KV tensor to its share of the
-            # available KV memory budget, which is not necessarily a
-            # multiple of the (unified-pool-derived) page size. Block
-            # ids only address the first ``num_gpu_blocks`` pages of
-            # this tensor anyway — slack at the end is unaddressed in
-            # the baseline too. Slice to the addressable region so the
-            # alias is exactly the byte range vLLM uses for KV.
+            # vLLM may give the layer slightly more bytes than
+            # num_gpu_blocks * page_size, but only the first
+            # num_gpu_blocks pages are addressable. Slice to that
+            # range so the alias matches what KV actually uses.
             required_bytes = block_pool.num_gpu_blocks * page_size_bytes
             if raw_kv.numel() < required_bytes:
                 raise RuntimeError(
@@ -6866,17 +6846,15 @@ class GPUModelRunner(
                 w13_bytes=self._unified_pool_w13_bytes,
                 w2_bytes=self._unified_pool_w2_bytes,
             )
-            pool.manager = manager  # back-reference for forward path
+            pool.manager = manager  # forward path needs the manager handle
             manager.register_layer(pool)
             moe_module.attach_unified_pool(pool)
 
-        # Warm the cache.
         warm_count = self.vllm_config.offload_config.expert_cache_size
         num_moe_layers = len(self._unified_pool_moe_modules)
-        # BlockPool's null block at index 0 is permanently held — exclude
-        # it from the budget. Warm-up shares one block_id across all
-        # layers per expert, so it consumes ``warm_count`` block_ids
-        # total, not ``warm_count × num_layers``.
+        # Block 0 is BlockPool's null block, so subtract it. Warm-up
+        # shares one block_id across all layers per expert, so the
+        # cost is warm_count block_ids in total.
         num_blocks_available = block_pool.num_gpu_blocks - 1
         if warm_count > num_blocks_available:
             raise RuntimeError(

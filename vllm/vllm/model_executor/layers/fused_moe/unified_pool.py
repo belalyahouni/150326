@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unified per-layer page pool for MoE expert weights and KV blocks.
+"""Unified per-layer page pool for expert weights and KV blocks.
 
-Phase 1 MVP: each MoE layer's KV byte tensor is aliased as a "pool buffer"
-shared between cached-prefix KV blocks and expert weight pages. A per-layer
-expert-recency list and one shared prefix-recency list together form the
-"per-layer mixed LRU" the plan describes — both bumped on every hit, both
-consulted at eviction time. The unmodified Triton fused_moe kernel still
-reads from a static staging tensor (full-width); real CPU->GPU DMAs on
-miss exercise PCIe latency honestly.
+The MVP aliases each layer's KV byte tensor as a pool buffer shared
+between prefix-cached KV blocks and expert weight pages. Eviction looks
+at a per-layer expert recency list and a shared prefix recency list and
+takes the colder side. The fused MoE kernel still reads from a static
+staging tensor (full-width experts), but CPU->GPU copies on miss happen
+for real so PCIe latency shows up in the numbers.
 """
 
 from __future__ import annotations
@@ -35,11 +34,7 @@ def move_experts_to_cpu(
     w13_weight: torch.nn.Parameter,
     w2_weight: torch.nn.Parameter,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Move expert weight tensors to CPU pinned memory.
-
-    Returns the new pinned (cpu_w13, cpu_w2) tensors. Used by both the
-    plain expert-cache path and the unified pool setup.
-    """
+    """Move expert weight tensors to CPU pinned memory and return them."""
     cpu_w13 = w13_weight.data
     cpu_w2 = w2_weight.data
     if cpu_w13.is_cuda:
@@ -54,27 +49,12 @@ def move_experts_to_cpu(
 
 
 class UnifiedPool:
-    """Per-layer pool state.
+    """Per-layer pool state for expert weights.
 
-    Holds:
-      - ``staging_w13``, ``staging_w2``: full-width GPU tensors
-        ``[num_experts, ...]`` filled once at startup. The unmodified
-        MoE kernel reads from these every forward.
-      - ``cpu_w13``, ``cpu_w2``: CPU-pinned source-of-truth tensors used
-        as DMA source on a miss.
-      - ``pool_buffer``: flat int8 view of the layer's KV byte tensor.
-        Real CPU->GPU DMAs land here on miss to exercise PCIe; the
-        kernel never reads it (Phase 1 simulation).
-      - ``expert_at_block: dict[block_id -> expert_id]``: which expert
-        ``L`` currently has loaded at this block.
-      - ``block_at_expert: dict[expert_id -> block_id]``: inverse.
-      - ``expert_lru: OrderedDict[expert_id, step]``: per-layer expert
-        recency, oldest first. ``move_to_end`` on every hit. **This is
-        the structure consulted at eviction time** — it is not a side
-        record.
-      - ``pinned_blocks: set[block_id]``: blocks pinned during the
-        current forward (kept off the eviction-candidate list until
-        release).
+    Tracks which expert sits at which block, the per-layer LRU of
+    experts, and the set of blocks pinned for the current forward.
+    The kernel reads from the staging tensors; pool_buffer is where
+    miss DMAs actually land so PCIe latency is real.
     """
 
     def __init__(
@@ -136,7 +116,7 @@ class UnifiedPool:
         )
         self.expert_at_block[block_id] = expert_id
         self.block_at_expert[expert_id] = block_id
-        self.expert_lru[expert_id] = step  # MRU on insert
+        self.expert_lru[expert_id] = step  # most-recently-used on insert
 
     def drop(self, block_id: int) -> int | None:
         expert_id = self.expert_at_block.pop(block_id, None)
@@ -147,12 +127,11 @@ class UnifiedPool:
         return expert_id
 
     def bump_expert(self, expert_id: int, step: int) -> None:
-        """Bump an expert to MRU on this layer's expert-recency list.
+        """Mark expert as MRU and stamp it with the current step.
 
-        Called for every expert touched in a forward — both hits (the
-        expert was already present) and misses (the expert was just
-        DMA'd in). The bump records ``step`` as the last-used time so
-        eviction can compare against the prefix list's recency.
+        Called for every expert touched this forward, hit or miss, so
+        the eviction step can compare expert recency against prefix
+        recency on equal terms.
         """
         if expert_id in self.expert_lru:
             self.expert_lru[expert_id] = step
@@ -160,22 +139,17 @@ class UnifiedPool:
 
 
 class UnifiedPoolManager:
-    """Manages per-layer pools, the cross-layer page index, and the
-    BlockPool callbacks for KV-driven cross-layer invalidation and
-    prefix-LRU upkeep.
+    """Owns the per-layer pools and the cross-layer bookkeeping.
 
-    The cross-layer index ``block_holder`` tracks two concerns
-    simultaneously (per plan §7.5): membership ("which layers hold an
-    expert at page P") and eviction driver ("which layers must be
-    invalidated when P is reused for KV"). Care is taken that
-    expert-driven invalidation only touches the calling layer; only
-    KV-driven allocation broadcasts.
+    block_holder maps block_id -> the set of layers that currently
+    hold an expert at that block, used both for membership lookups
+    and to broadcast invalidations when KV reclaims the block.
+    Expert misses only touch the calling layer; KV allocations
+    broadcast to every holder.
 
-    The shared ``prefix_lru`` is the prefix-side half of the per-layer
-    mixed LRU (§2). Every layer reads from it at eviction time; we
-    keep one shared copy rather than N redundant per-layer copies
-    because attention reads block_id B at every layer in lockstep, so
-    prefix hit-recency is naturally global.
+    prefix_lru is shared because attention touches the same block id
+    at every layer in lockstep, so a single global prefix recency
+    list is enough.
     """
 
     def __init__(self, block_pool, device: torch.device) -> None:
@@ -187,11 +161,10 @@ class UnifiedPoolManager:
         self.layers: dict[int, UnifiedPool] = {}
         self.block_holder: dict[int, set[int]] = {}
         self.transfer_stream = torch.cuda.Stream(device=device)
-        self.step = 0  # increments per forward; used as MRU timestamp
+        self.step = 0  # incremented per forward; used as the MRU timestamp
 
-        # Shared prefix-recency list. Block_id -> last-used step.
-        # OrderedDict iteration gives oldest first; move_to_end on
-        # every prefix hit. Maintained via BlockPool callbacks.
+        # block_id -> last-used step, oldest first. Updated by the
+        # BlockPool prefix callbacks below.
         self.prefix_lru: OrderedDict[int, int] = OrderedDict()
 
         self.block_pool.register_on_allocation_callback(self._on_kv_allocation)
@@ -199,13 +172,8 @@ class UnifiedPoolManager:
         self.block_pool.register_on_prefix_removed_callback(
             self._on_prefix_removed
         )
-        # Route KV victim selection through unified-pool LRUs (replaces
-        # standard ``popleft_n``). Tier 1 picks a truly-free block (no
-        # prefix hash, no expert mapping in any layer); Tier 2 LRU-
-        # compares oldest expert across all layers vs oldest prefix
-        # and takes the colder. Mirrors ``_select_victim_block`` for
-        # the KV side, closing the asymmetry that previously let KV
-        # demand cannibalise prefix or arbitrarily evict experts.
+        # Override BlockPool's default popleft_n so KV allocations also
+        # consult the unified LRUs, the same way expert misses do.
         self.block_pool.register_kv_victim_selector(
             self._select_kv_victim_blocks
         )
@@ -216,9 +184,7 @@ class UnifiedPoolManager:
         )
         self.layers[layer.layer_idx] = layer
 
-    # ------------------------------------------------------------------
-    # Mapping helpers
-    # ------------------------------------------------------------------
+    # Mapping helpers.
 
     def _add_holder(self, layer_idx: int, block_id: int) -> None:
         self.block_holder.setdefault(block_id, set()).add(layer_idx)
@@ -235,11 +201,11 @@ class UnifiedPoolManager:
         self, layer: UnifiedPool, block_id: int, cause: str,
         tier: str | None = None,
     ) -> None:
-        """Drop ``layer``'s mapping at ``block_id`` if any.
+        """Drop only this layer's mapping for the block.
 
-        Used when ``layer`` itself is overwriting bytes at this block
-        (expert miss in this layer). Other layers' mappings are left
-        untouched — their physical bytes are not affected.
+        Used on an expert miss where the layer is about to overwrite
+        its own bytes. Other layers keep their mappings; nothing
+        physical changes for them.
         """
         evicted = layer.drop(block_id)
         if evicted is None:
@@ -254,11 +220,7 @@ class UnifiedPoolManager:
             )
 
     def _broadcast_drop_all_layers(self, block_id: int, cause: str) -> None:
-        """Drop every layer's mapping at ``block_id`` (KV allocation).
-
-        Used when KV writes physically overwrite all layers' bytes at
-        this block.
-        """
+        """Drop every layer's mapping at the block (KV is overwriting it)."""
         holders = self.block_holder.pop(block_id, None)
         if not holders:
             return
@@ -277,12 +239,11 @@ class UnifiedPoolManager:
     def _evict_prefix_globally(
         self, block_id: int, cause: str, tier: str | None = None
     ) -> None:
-        """Clear the prefix hash for ``block_id`` across the BlockPool.
+        """Clear the block's prefix hash everywhere.
 
-        Cached prefix is a global concept (same hash at every layer),
-        so once any layer overwrites its bytes the prefix is broken
-        everywhere. Hash-clear fires the on_prefix_removed callback
-        which drops the entry from ``prefix_lru``.
+        Once any layer overwrites the block's bytes the prefix is
+        broken in every layer, since the hash is global. Clearing the
+        hash fires on_prefix_removed which drops it from prefix_lru.
         """
         block = self.block_pool.blocks[block_id]
         if block.block_hash is None:
@@ -296,26 +257,21 @@ class UnifiedPoolManager:
                 flush=True,
             )
 
-    # ------------------------------------------------------------------
-    # BlockPool callbacks
-    # ------------------------------------------------------------------
+    # BlockPool callbacks.
 
     def _on_kv_allocation(self, block_ids: list[int]) -> None:
-        """Scheduler claimed these blocks for active KV — KV writes are
-        about to overwrite all layers' bytes there. Drop every layer's
-        expert mapping at each block. (Prefix hashes were already
-        cleared by ``_maybe_evict_cached_block`` before this callback
-        fired, which also fired ``_on_prefix_removed``.)
+        """KV is about to overwrite these blocks; drop every layer's
+        expert mapping for each one. Prefix hashes were already
+        cleared upstream and fired _on_prefix_removed.
         """
         for block_id in block_ids:
             self._broadcast_drop_all_layers(block_id, cause="kv-alloc")
 
     def _on_prefix_added(self, block_id: int) -> None:
-        """A block re-entered the free queue with a hash → it is now
-        an evictable cached-prefix entry. Bump it to MRU on the
-        prefix-recency list. The bump-on-free is the bump-on-hit
-        signal for prefix recency: the request that just released it
-        finished using these bytes at this step.
+        """A cached-prefix block has been freed: bump it to MRU.
+
+        Returning to the free queue with a hash counts as a use, so
+        prefix recency stamps it with the current step.
         """
         self.prefix_lru[block_id] = self.step
         self.prefix_lru.move_to_end(block_id, last=True)
@@ -327,10 +283,7 @@ class UnifiedPoolManager:
             )
 
     def _on_prefix_removed(self, block_id: int) -> None:
-        """The block stopped being an evictable cached-prefix entry —
-        either ``touch`` pinned it for active use, or its hash was
-        cleared. Either way, drop from the prefix-recency list.
-        """
+        """Block is no longer an evictable cached prefix; drop from prefix_lru."""
         removed = self.prefix_lru.pop(block_id, None)
         if _trace_enabled():
             was_present = "yes" if removed is not None else "no"
@@ -340,24 +293,19 @@ class UnifiedPoolManager:
                 flush=True,
             )
 
-    # ------------------------------------------------------------------
-    # Warm-up at Stage 2
-    # ------------------------------------------------------------------
+    # Stage 2 warm-up.
 
     def warm_up(self, warm_count: int) -> None:
-        """Pre-load ``warm_count`` experts per layer at startup.
+        """Pre-load warm_count experts per layer at startup.
 
-        One block_id is shared across all layers per expert: every
-        layer's E_k lives at the same block_id (different bytes in
-        each layer's pool buffer, since pool buffers are per-layer).
-        Total block_ids consumed = ``warm_count``, regardless of
-        ``num_layers``. So the minimum pool size is
-        ``warm_count + 1`` (the +1 is the null block at id 0).
+        Each warmed expert reuses the same block_id across every
+        layer (different physical bytes per layer because the pool
+        buffer is per-layer), so total block_ids consumed equals
+        warm_count regardless of layer count. The minimum pool size
+        is warm_count + 1 (block 0 is the null block).
 
-        Trade-off vs disjoint warming: because every warmed block_id
-        has all layers as holders, any KV-driven kv-broadcast on one
-        of these ids will drop expert mappings at every layer at
-        once. That's the cost of the shared-id contract.
+        The shared-id approach means a KV broadcast on a warmed
+        block invalidates that expert in every layer at once.
         """
         if warm_count <= 0:
             return
@@ -370,10 +318,9 @@ class UnifiedPoolManager:
         if not layers_list:
             return
         for expert_id in range(warm_count):
-            # Pick one block_id, share it across all layers for this
-            # expert. ``layers_list[0]`` is just the perspective used
-            # to walk the free queue; result is whichever block sits
-            # at the queue head.
+            # Pick one block and share it across all layers for this
+            # expert. layers_list[0] is just whose view we use to walk
+            # the free queue — we get whichever block is at the head.
             block, _tier = self._select_victim_block(
                 layers_list[0], needed_set=set()
             )
@@ -397,26 +344,20 @@ class UnifiedPoolManager:
                 layer.num_experts,
             )
 
-    # ------------------------------------------------------------------
-    # Forward-path API
-    # ------------------------------------------------------------------
+    # Forward-path API.
 
     def ensure_loaded(
         self, layer: UnifiedPool, needed_expert_ids: list[int]
     ) -> None:
-        """Ensure all ``needed_expert_ids`` are present at ``layer``'s
-        pool. Pins all hits and miss-claimed blocks for the duration
-        of the forward (released by ``release_pinned``). Mandatory
-        ``wait_stream`` barrier after DMAs.
+        """Make sure every needed expert is loaded at layer.
 
-        Bumps every needed expert to MRU on ``layer.expert_lru`` —
-        hits and misses both. Without this bump the LRU would track
-        claim-recency rather than use-recency (the §7.6 failure mode).
-
-        Trace snapshots are captured BEFORE any state mutation
-        (per plan §7.2).
+        Hits and miss-claimed blocks are pinned for the rest of this
+        forward (released by release_pinned). DMAs end with a
+        wait_stream barrier on the compute stream. Every needed
+        expert is bumped to MRU regardless of hit/miss, so the LRU
+        tracks use recency rather than claim recency. Trace
+        snapshots are captured before any mutation.
         """
-        # --- Pass 1: classify hits/misses (no mutation yet) ---
         hit_results: list[tuple[int, int]] = []  # (eid, block_id)
         miss_eids: list[int] = []
         needed_set = set(needed_expert_ids)
@@ -426,28 +367,26 @@ class UnifiedPoolManager:
             else:
                 miss_eids.append(eid)
 
-        # Trace BEFORE mutation. Per-step header + per-layer composition
-        # snapshot + LRU orderings + the router's request.
+        # Trace before any state changes.
         if _trace_enabled():
             self._trace_pre_mutation(layer, needed_expert_ids)
 
-        # Now apply mutation: bump hit/miss counters, pin hit blocks,
-        # and bump every hit expert to MRU on the layer's LRU.
+        # Counters, pinning hit blocks, and MRU bumps for hits.
         layer.hits += len(hit_results)
         layer.misses += len(miss_eids)
         for eid, block_id in hit_results:
             layer.pinned_blocks.add(block_id)
             layer.bump_expert(eid, self.step)
 
-        # --- Pass 2: claim a block per miss. ---
+        # Claim a block per miss.
         miss_assignments: list[tuple[int, int, str]] = []  # (eid, bid, tier)
         for eid in miss_eids:
             block, tier = self._select_victim_block(layer, needed_set)
             block_id = block.block_id
             cause = f"expert-L{layer.layer_idx}"
             if _trace_enabled() and tier.startswith("free"):
-                # Tier 1 free-claim has no eviction line; emit a CLAIM
-                # so the trace still shows where each miss landed.
+                # Free-tier claims don't generate an EVICT line, so emit
+                # a CLAIM so the trace still shows where the miss landed.
                 print(
                     f"UNIFIED CLAIM page={block_id} L{layer.layer_idx} "
                     f"E{eid} cause={cause} tier={tier}",
@@ -455,7 +394,7 @@ class UnifiedPoolManager:
                 )
             self._evict_prefix_globally(block_id, cause=cause, tier=tier)
             self._drop_layer_mapping(layer, block_id, cause=cause, tier=tier)
-            # ``assign`` records ``step`` as MRU for this expert.
+            # assign() stamps the expert with the current step as MRU.
             layer.assign(block_id, eid, step=self.step)
             self._add_holder(layer.layer_idx, block_id)
             layer.pinned_blocks.add(block_id)
@@ -476,7 +415,7 @@ class UnifiedPoolManager:
             )
             print(f"--- end L{layer.layer_idx} ---", flush=True)
 
-        # --- Pass 3: batch DMAs on transfer_stream + barrier. ---
+        # Issue all miss DMAs on the transfer stream, then sync.
         if miss_assignments:
             with torch.cuda.stream(self.transfer_stream):
                 for eid, block_id, _tier in miss_assignments:
@@ -492,37 +431,23 @@ class UnifiedPoolManager:
     def end_forward_step(self) -> None:
         self.step += 1
 
-    # ------------------------------------------------------------------
-    # Victim selection — the plan's per-layer mixed LRU at query time.
-    # ------------------------------------------------------------------
+    # Per-layer victim selection.
 
     def _select_victim_block(
         self, layer: UnifiedPool, needed_set: set[int]
     ):
-        """Pick the coldest evictable block for ``layer``.
+        """Pick the coldest evictable block for this layer.
 
-        Returns a ``(block, tier)`` tuple where ``tier`` is one of
-        ``"free-pure"`` (truly empty slot), ``"free-cross-layer-expert"``
-        (slot holds another layer's expert; safe to claim because pool
-        buffers are per-layer), ``"expert-local"`` (evicted from L's
-        own expert LRU), or ``"prefix-global"`` (evicted from the
-        shared prefix LRU).
-
-        Three-tier search:
-
-        1. **Free space from L's view.** Walk ``free_block_queue`` and
-           return the first block that has no hash and no expert
-           mapping in ``layer``.
-        2. **Coldest entry in L's mixed LRU.** Compare front of
-           ``layer.expert_lru`` against front of the shared
-           ``prefix_lru``; whichever has the smaller ``step`` (last
-           used longer ago) wins. Skip pinned and currently-needed.
-        3. **Fail loudly.** If neither side has a non-pinned
-           candidate, the pool is exhausted — raise.
+        Returns (block, tier). Tier 1 walks the free queue and grabs
+        the first block with no hash and no expert mapping in this
+        layer. Tier 2 compares the oldest non-pinned entry in this
+        layer's expert LRU against the head of the shared prefix
+        LRU, taking whichever has the smaller step. Raises if
+        neither tier has a candidate.
         """
         queue = self.block_pool.free_block_queue
 
-        # Tier 1: free space from L's perspective.
+        # Tier 1: free from this layer's perspective.
         cursor = queue.fake_free_list_head.next_free_block
         while cursor is not None and cursor is not queue.fake_free_list_tail:
             block_id = cursor.block_id
@@ -545,7 +470,7 @@ class UnifiedPoolManager:
                 tier = "free-pure"
             return cursor, tier
 
-        # Tier 2: coldest of (L's expert LRU, shared prefix LRU).
+        # Tier 2: pick whichever LRU has the colder head.
         oldest_expert_eid: int | None = None
         oldest_expert_step: int | None = None
         for eid, step in layer.expert_lru.items():
@@ -598,10 +523,7 @@ class UnifiedPoolManager:
             "--max-num-batched-tokens or increase --num-gpu-blocks-override."
         )
 
-    # ------------------------------------------------------------------
-    # KV victim selection — symmetric counterpart of _select_victim_block
-    # but for KV-allocation demand (no specific layer of origin).
-    # ------------------------------------------------------------------
+    # KV-side victim selection (no layer of origin).
 
     def _any_layer_pins(self, block_id: int) -> bool:
         """True if any registered layer currently pins ``block_id``."""
@@ -613,9 +535,10 @@ class UnifiedPoolManager:
     def _oldest_global_expert(
         self,
     ) -> tuple[int | None, int | None]:
-        """Return (block_id, step) of the globally LRU-oldest expert
-        across all layers, or (None, None) if no evictable expert
-        exists. Skips experts whose blocks are pinned by any layer.
+        """Oldest non-pinned expert across all layers.
+
+        Returns (block_id, step) or (None, None) if every expert is
+        pinned by some layer.
         """
         best_step: int | None = None
         best_block: int | None = None
@@ -629,30 +552,20 @@ class UnifiedPoolManager:
                 if best_step is None or step < best_step:
                     best_step = step
                     best_block = block_id
-                # Inner LRU is ordered oldest-first; the first
-                # non-pinned entry is this layer's contribution. No
-                # need to keep scanning further into this layer.
+                # The LRU is oldest-first, so the first non-pinned
+                # entry is the best this layer can offer.
                 break
         return best_block, best_step
 
     def _select_kv_victim_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
-        """Pick ``num_blocks`` victims for KV allocation.
+        """Pick num_blocks victims for KV allocation.
 
-        Two-tier selection mirroring ``_select_victim_block`` for the
-        expert path:
-
-        1. **Tier 1 — truly free.** Walk the free queue front-to-back.
-           Take the first block with no prefix hash AND no expert
-           mapping in any layer AND not pinned. Cost = 0.
-        2. **Tier 2 — LRU compare.** Otherwise compare oldest expert
-           (across all layers' ``expert_lru`` tails) vs oldest prefix
-           (``prefix_lru`` head). Take whichever has smaller step.
-
-        Each returned block is already removed from the free queue.
-        Post-selection housekeeping in ``BlockPool.get_new_blocks``
-        (hash clearing, ``_on_kv_allocation`` broadcast that drops
-        any expert mappings on the chosen blocks) runs unchanged.
-        Called once per ``get_new_blocks`` request, picks N blocks.
+        Mirrors _select_victim_block but for the KV side. Tier 1
+        takes blocks that are truly free (no hash, no expert
+        mapping, not pinned). Tier 2 compares the oldest expert
+        across every layer with the oldest prefix and takes the
+        colder. Returned blocks are already off the free queue;
+        BlockPool.get_new_blocks does the rest of the bookkeeping.
         """
         if num_blocks == 0:
             return []
@@ -661,16 +574,14 @@ class UnifiedPoolManager:
         for _ in range(num_blocks):
             block = self._pick_one_kv_victim()
             ret.append(block)
-        # Sanity: all picked blocks left the queue and got their
-        # bookkeeping kept consistent.
         assert queue.num_free_blocks >= 0
         return ret
 
     def _pick_one_kv_victim(self) -> KVCacheBlock:
-        """Pick one victim block for KV. Removes from free queue."""
+        """Pick one KV victim block and remove it from the free queue."""
         queue = self.block_pool.free_block_queue
 
-        # Tier 1: truly free — no hash, no expert mapping, not pinned.
+        # Tier 1: truly free.
         cursor = queue.fake_free_list_head.next_free_block
         while cursor is not None and cursor is not queue.fake_free_list_tail:
             nxt = cursor.next_free_block
@@ -692,7 +603,7 @@ class UnifiedPoolManager:
                 )
             return cursor
 
-        # Tier 2: LRU compare oldest expert vs oldest prefix.
+        # Tier 2: pick whichever LRU has the colder head.
         oldest_expert_bid, oldest_expert_step = self._oldest_global_expert()
 
         oldest_prefix_bid: int | None = None
@@ -741,17 +652,12 @@ class UnifiedPoolManager:
             "increase --num-gpu-blocks-override."
         )
 
-    # ------------------------------------------------------------------
-    # DMA helpers
-    # ------------------------------------------------------------------
+    # DMA helpers.
 
     def _dma_expert_into_block_async(
         self, layer: UnifiedPool, expert_id: int, block_id: int
     ) -> None:
-        """Async CPU->GPU copy of expert weights into ``layer``'s pool
-        page at ``block_id``. The Phase 1 kernel never reads these
-        bytes, but the DMA still measures PCIe latency honestly.
-        """
+        """Async CPU->GPU copy of expert weights into the layer's pool page."""
         page_offset = block_id * layer.page_size_bytes
         w13_dst = layer.pool_buffer.narrow(
             0, page_offset, layer.w13_bytes
@@ -768,17 +674,13 @@ class UnifiedPoolManager:
         with torch.cuda.stream(self.transfer_stream):
             self._dma_expert_into_block_async(layer, expert_id, block_id)
 
-    # ------------------------------------------------------------------
-    # Trace helpers (only called when VLLM_UNIFIED_POOL_TRACE=1)
-    # ------------------------------------------------------------------
+    # Trace helpers (active when VLLM_UNIFIED_POOL_TRACE=1).
 
     def _trace_pre_mutation(
         self, layer: UnifiedPool, needed_expert_ids: list[int]
     ) -> None:
-        """Emit the per-step header, per-layer pool composition, both
-        LRU orderings (MRU→LRU), and the router's request — all
-        captured BEFORE any state mutation in ``ensure_loaded``.
-        """
+        """Dump the step header, pool composition, both LRUs and the
+        router's request before any state mutation."""
         capacity = len(self.block_pool.blocks)
         n_expert_ours = len(layer.expert_at_block)
         n_prefix = len(self.prefix_lru)
@@ -815,8 +717,8 @@ class UnifiedPoolManager:
             flush=True,
         )
 
-        # MRU→LRU iteration: OrderedDict puts MRU at the END
-        # (move_to_end last=True), so reverse for display.
+        # OrderedDict has MRU at the end (move_to_end last=True); flip
+        # so the printed order reads MRU first.
         expert_lru_str = ", ".join(
             f"E{eid}@p{layer.block_at_expert.get(eid, '?')}#step{step}"
             for eid, step in reversed(layer.expert_lru.items())
@@ -843,9 +745,7 @@ class UnifiedPoolManager:
             flush=True,
         )
 
-    # ------------------------------------------------------------------
-    # Stats / introspection
-    # ------------------------------------------------------------------
+    # Stats / introspection.
 
     def log_stats(self) -> None:
         num_kv_prefix = len(self.prefix_lru)
