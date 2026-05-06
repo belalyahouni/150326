@@ -630,11 +630,9 @@ class FusedMoE(CustomOp):
         self.quant_method.create_weights(layer=self, **moe_quant_params)
         self.base_quant_method = self.quant_method
 
-        # Expert cache: keep expert weights on CPU pinned RAM with a
-        # GPU-resident LRU cache for hot experts.  Actual CPU pinning
-        # happens in _maybe_init_expert_cache() AFTER weights are loaded,
-        # so we don't strip the weight_loader attribute needed by vLLM's
-        # weight loading system.
+        # Defer building the expert cache until _maybe_init_expert_cache()
+        # runs after weights are loaded; pinning weights here would strip
+        # the weight_loader attributes vLLM relies on.
         self._expert_cache = None
         self._expert_cache_size = (
             vllm_config.offload_config.expert_cache_size
@@ -714,15 +712,14 @@ class FusedMoE(CustomOp):
                 )
             )
 
-        # Initialize expert cache after all weights are loaded.
         self._maybe_init_expert_cache()
 
     def _maybe_init_expert_cache(self) -> None:
-        """Construct the GPU expert cache if expert offloading is enabled.
+        """Build the GPU expert cache if expert offloading is enabled.
 
-        Called after all weights are loaded and post-processed.  The cache
-        is pre-populated with the first ``cache_size`` experts so it is
-        warm before the first inference token.
+        Runs after weights have been loaded. The cache is pre-warmed with
+        the first ``cache_size`` experts so the first forward pass already
+        has something to hit.
         """
         if self._expert_cache is not None or self._expert_cache_size <= 0:
             return
@@ -735,12 +732,12 @@ class FusedMoE(CustomOp):
 
         cpu_w13 = self.w13_weight.data
         cpu_w2 = self.w2_weight.data
-        # Move to CPU if still on GPU (weights are loaded on GPU by default)
+        # Weights load on GPU by default, so move them off first.
         if cpu_w13.is_cuda:
             cpu_w13 = cpu_w13.cpu()
         if cpu_w2.is_cuda:
             cpu_w2 = cpu_w2.cpu()
-        # Pin memory for async DMA transfers
+        # Pinned memory is required for async CPU->GPU copies.
         if not cpu_w13.is_pinned():
             cpu_w13 = cpu_w13.pin_memory()
         if not cpu_w2.is_pinned():
@@ -1577,40 +1574,32 @@ class FusedMoE(CustomOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass using the GPU expert cache.
+        """Forward pass that goes through the GPU expert cache.
 
-        1. Route tokens to experts.
-        2. Ensure needed experts are in the GPU cache (DMA on miss).
-        3. Remap expert IDs to cache slot indices so the kernel indexes
-           directly into the cache buffers (no gather/copy needed).
-        4. Temporarily swap layer attributes so the kernel reads from
-           the cache buffers, then call ``quant_method.apply``.
-        5. Restore original attributes.
+        Routes tokens, makes sure the experts they need are loaded into
+        the cache, rewrites the topk ids so they point at cache slots,
+        and then runs the existing quant_method.apply. The original
+        weight references are restored afterwards.
         """
         assert self._expert_cache is not None
 
-        # --- Router ---
         topk_weights, topk_ids = self.runner.router.select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
         )
 
-        # --- Unique experts needed for this batch ---
         needed_expert_ids = topk_ids.unique().tolist()
 
-        # --- Ensure all needed experts are in the GPU cache ---
         self._expert_cache.ensure_experts_loaded(needed_expert_ids)
 
-        # --- Remap global expert IDs → cache slot indices ---
-        # The kernel indexes into the weight tensor using topk_ids.
-        # Cache slot indices let it read directly from the cache buffers
-        # without an intermediate gather copy.
+        # Rewrite topk_ids so each entry points at the expert's cache
+        # slot rather than its global id. That way the kernel reads
+        # straight out of the cache buffers.
         expert_to_slot = self._expert_cache.expert_to_slot
         remapped_ids = topk_ids.clone()
         for global_id in needed_expert_ids:
             remapped_ids[topk_ids == global_id] = expert_to_slot[global_id]
 
-        # --- Swap layer attributes temporarily ---
         orig_w13 = self.w13_weight.data
         orig_w2 = self.w2_weight.data
         orig_num_experts = self.global_num_experts
@@ -1622,7 +1611,6 @@ class FusedMoE(CustomOp):
             self.global_num_experts = self._expert_cache.cache_size
             self._expert_map = None
 
-            # --- Kernel call ---
             result = self.quant_method.apply(
                 layer=self,
                 x=hidden_states,
@@ -1631,13 +1619,11 @@ class FusedMoE(CustomOp):
                 shared_experts_input=None,
             )
         finally:
-            # --- Restore ---
             self.w13_weight.data = orig_w13
             self.w2_weight.data = orig_w2
             self.global_num_experts = orig_num_experts
             self._expert_map = orig_expert_map
 
-        # --- Update LRU ---
         self._expert_cache.mark_recently_used(needed_expert_ids)
 
         return result

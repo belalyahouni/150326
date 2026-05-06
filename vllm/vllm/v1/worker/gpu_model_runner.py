@@ -4587,19 +4587,16 @@ class GPUModelRunner(
             ):
                 prepare_communication_buffer_for_model(drafter_model)
 
-            # Initialize expert caches for MoE layers after weights are loaded.
-            # This must happen before profile_run / torch.compile tracing.
+            # Build expert caches once weights are loaded, before profile_run
+            # and any torch.compile tracing.
             if self.vllm_config.offload_config.expert_offload:
                 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
                 for module in self.model.modules():
                     if isinstance(module, FusedMoE):
                         module._maybe_init_expert_cache()
-                # _maybe_init_expert_cache moves all experts to CPU pinned
-                # memory and allocates only cache_size slots back on GPU.
-                # Re-measure so the KV budget reflects the post-cache
-                # footprint instead of the pre-move all-experts peak —
-                # otherwise --expert-cache-size has no effect on the
-                # auto-computed KV-cache memory.
+                # Most expert weights now live on CPU, so the recorded model
+                # footprint is too high. Re-measure so the auto KV budget
+                # actually shrinks when --expert-cache-size is small.
                 gc.collect()
                 post_cache_memory = current_platform.get_current_memory_usage(
                     self.device
