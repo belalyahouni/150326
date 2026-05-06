@@ -631,19 +631,17 @@ class FusedMoE(CustomOp):
         self.quant_method.create_weights(layer=self, **moe_quant_params)
         self.base_quant_method = self.quant_method
 
-        # Expert cache: keep expert weights on CPU pinned RAM with a
-        # GPU-resident LRU cache for hot experts.  Actual CPU pinning
-        # happens in _maybe_init_expert_cache() AFTER weights are loaded,
-        # so we don't strip the weight_loader attribute needed by vLLM's
-        # weight loading system.
+        # Defer building the expert cache until _maybe_init_expert_cache()
+        # runs after weights are loaded; pinning weights here would strip
+        # the weight_loader attributes vLLM relies on.
         self._expert_cache = None
         self._expert_cache_size = (
             vllm_config.offload_config.expert_cache_size
             if vllm_config.offload_config.expert_offload
             else 0
         )
-        # Unified-pool path: populated by the worker after weights are
-        # loaded (Stage 1) and again with a manager reference (Stage 2).
+        # Unified-pool side: the worker fills these in once weights are
+        # loaded (stage 1) and once the manager is ready (stage 2).
         self._unified_pool = None
         self._unified_pool_enabled = (
             vllm_config.offload_config.expert_offload
@@ -722,15 +720,14 @@ class FusedMoE(CustomOp):
                 )
             )
 
-        # Initialize expert cache after all weights are loaded.
         self._maybe_init_expert_cache()
 
     def _maybe_init_expert_cache(self) -> None:
-        """Construct the GPU expert cache if expert offloading is enabled.
+        """Build the GPU expert cache if expert offloading is enabled.
 
-        Called after all weights are loaded and post-processed.  The cache
-        is pre-populated with the first ``cache_size`` experts so it is
-        warm before the first inference token.
+        Runs after weights have been loaded. The cache is pre-warmed with
+        the first ``cache_size`` experts so the first forward pass already
+        has something to hit.
         """
         if self._expert_cache is not None or self._expert_cache_size <= 0:
             return
@@ -766,17 +763,13 @@ class FusedMoE(CustomOp):
         )
 
     def unified_pool_stage1(self) -> dict[str, Any]:
-        """Stage-1 of unified pool init (Phase 2): pin experts to CPU
-        and stash the pinned tensors for Stage 2.
+        """Pin experts to CPU and stash the tensors for Stage 2.
 
-        Phase 2 reads expert weights directly from the pool buffer, so
-        no GPU staging is allocated here. The CPU-pinned tensors are
-        the DMA source on miss; the GPU pool buffer (allocated later
-        as the KV byte tensor alias) is the kernel's read source via
-        the strided views built inside ``UnifiedPool.__init__``.
-
-        Returns metadata describing this layer's expert slot, used by
-        the worker to derive ``block_size_tokens``.
+        No GPU staging here: the kernel reads weights straight out
+        of the pool buffer through strided views built later in
+        UnifiedPool.__init__. The CPU-pinned tensors are the DMA
+        source on miss. The returned metadata is what the worker
+        uses to choose block_size_tokens.
         """
         from vllm.model_executor.layers.fused_moe.unified_pool import (
             move_experts_to_cpu,
@@ -812,9 +805,7 @@ class FusedMoE(CustomOp):
         }
 
     def attach_unified_pool(self, pool) -> None:
-        """Stage-2: attach the per-layer ``UnifiedPool`` so forward
-        dispatches to ``_forward_with_unified_pool``.
-        """
+        """Attach the layer's UnifiedPool so forward routes through it."""
         self._unified_pool = pool
 
     @property
@@ -1631,29 +1622,14 @@ class FusedMoE(CustomOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass using the unified per-layer page pool (Phase 2).
+        """Forward pass that goes through the unified-pool manager.
 
-        1. Route tokens to experts and dedupe to needed expert ids.
-        2. Manager ensures them loaded — pins hits, allocates+DMAs misses.
-        3. Remap ``topk_ids`` from global expert ids to per-layer
-           block_ids via ``pool.block_id_at`` (a small int64 GPU tensor).
-        4. Swap ``w13_weight.data`` / ``w2_weight.data`` to point at the
-           strided pool views (``[num_gpu_blocks, *expert_shape]``).
-           Set ``global_num_experts = num_gpu_blocks`` and
-           ``_expert_map = None`` so ``moe_align_block_size`` and the
-           kernel see a self-consistent index space.
-        5. Run ``quant_method.apply`` inside try/finally that restores
-           the originals.
-        6. Release pinned blocks and advance the manager's step counter.
-
-        Same trick as ``_forward_with_expert_cache``, with two
-        substitutions: "cache slot" → "pool block_id," and "contiguous
-        ``[cache_size, ...]`` GPU tensor" → "strided
-        ``[num_gpu_blocks, ...]`` view over the pool buffer." The kernel
-        is unmodified — the strided view's ``stride(0) = page_size_bytes
-        / element_size`` makes the kernel walk one page per expert row,
-        even though successive rows aren't packed contiguously (the
-        gap holds w2 within each page).
+        Same shape as _forward_with_expert_cache, just with block_ids
+        instead of cache slot indices and a strided pool view in
+        place of a packed cache tensor. The view's stride(0) equals
+        page_size_bytes / element_size, so the unmodified kernel
+        walks one page per expert row even though the rows aren't
+        packed contiguously in memory.
         """
         assert self._unified_pool is not None
         pool = self._unified_pool
@@ -1667,16 +1643,14 @@ class FusedMoE(CustomOp):
         needed_expert_ids = topk_ids.unique().tolist()
         manager.ensure_loaded(pool, needed_expert_ids)
 
-        # Remap global expert ids → per-layer block_ids. After
-        # ``ensure_loaded``, every expert id in ``topk_ids`` has a
-        # valid (non-sentinel) entry in ``block_id_at``. Indexing in
-        # ``int64`` matches the kernel's int64 cast on expert ids.
+        # ensure_loaded guarantees every expert id we need has a real
+        # (non-sentinel) entry in block_id_at. int64 indexing matches
+        # the kernel's int64 cast.
         remapped_ids = pool.block_id_at[topk_ids]
 
-        # ---- Phase-2 paranoid byte check (one-shot, layer 0 only) ----
-        # Prove the kernel will read the right bytes at kernel-call time.
-        # Compare each unique remapped block_id's pool_w13_view row
-        # against the CPU truth for the expert it should hold.
+        # Optional one-shot sanity check: at the very first forward of
+        # layer 0, compare each remapped block's pool view against the
+        # CPU truth for the expert it should hold.
         if (
             os.environ.get("VLLM_UNIFIED_POOL_PARANOID", "0") == "1"
             and pool.layer_idx == 0
@@ -1742,40 +1716,32 @@ class FusedMoE(CustomOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass using the GPU expert cache.
+        """Forward pass that goes through the GPU expert cache.
 
-        1. Route tokens to experts.
-        2. Ensure needed experts are in the GPU cache (DMA on miss).
-        3. Remap expert IDs to cache slot indices so the kernel indexes
-           directly into the cache buffers (no gather/copy needed).
-        4. Temporarily swap layer attributes so the kernel reads from
-           the cache buffers, then call ``quant_method.apply``.
-        5. Restore original attributes.
+        Routes tokens, makes sure the experts they need are loaded into
+        the cache, rewrites the topk ids so they point at cache slots,
+        and then runs the existing quant_method.apply. The original
+        weight references are restored afterwards.
         """
         assert self._expert_cache is not None
 
-        # --- Router ---
         topk_weights, topk_ids = self.runner.router.select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
         )
 
-        # --- Unique experts needed for this batch ---
         needed_expert_ids = topk_ids.unique().tolist()
 
-        # --- Ensure all needed experts are in the GPU cache ---
         self._expert_cache.ensure_experts_loaded(needed_expert_ids)
 
-        # --- Remap global expert IDs → cache slot indices ---
-        # The kernel indexes into the weight tensor using topk_ids.
-        # Cache slot indices let it read directly from the cache buffers
-        # without an intermediate gather copy.
+        # Rewrite topk_ids so each entry points at the expert's cache
+        # slot rather than its global id. That way the kernel reads
+        # straight out of the cache buffers.
         expert_to_slot = self._expert_cache.expert_to_slot
         remapped_ids = topk_ids.clone()
         for global_id in needed_expert_ids:
             remapped_ids[topk_ids == global_id] = expert_to_slot[global_id]
 
-        # --- Swap layer attributes temporarily ---
         orig_w13 = self.w13_weight.data
         orig_w2 = self.w2_weight.data
         orig_num_experts = self.global_num_experts
@@ -1787,7 +1753,6 @@ class FusedMoE(CustomOp):
             self.global_num_experts = self._expert_cache.cache_size
             self._expert_map = None
 
-            # --- Kernel call ---
             result = self.quant_method.apply(
                 layer=self,
                 x=hidden_states,
@@ -1796,13 +1761,11 @@ class FusedMoE(CustomOp):
                 shared_experts_input=None,
             )
         finally:
-            # --- Restore ---
             self.w13_weight.data = orig_w13
             self.w2_weight.data = orig_w2
             self.global_num_experts = orig_num_experts
             self._expert_map = orig_expert_map
 
-        # --- Update LRU ---
         self._expert_cache.mark_recently_used(needed_expert_ids)
 
         return result

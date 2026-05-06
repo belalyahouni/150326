@@ -1,24 +1,22 @@
-"""Generate alternating-prefix prompts JSONL for Scenario A benchmark.
+"""Generate alternating-prefix prompts (JSONL) for scenario A.
 
-Two repeated-character prefixes (PREFIX_TOKENS tokens each) alternated across
-NUM_PROMPTS requests. **No random suffix** — each prompt is just the prefix.
-This minimises expert-routing variety so the workload exercises the unified
-pool's prefix-vs-expert tradeoff cleanly: per the variety probe in
-`expert_variety_test.md`, a pure single-character prefix touches only ~11-20/64
-experts per layer, leaving the rest cold and cleanly evictable.
+Two repeated-character prefixes of PREFIX_TOKENS tokens, alternated
+across NUM_PROMPTS requests. No random suffix; each prompt is just
+the prefix. A pure single-character prompt only routes to ~11-20 of
+64 experts per layer in our probe, so the workload exercises the
+prefix-vs-expert tradeoff cleanly.
 
-Each character has very different BPE behaviour with the OLMoE tokenizer (a
-single "a" * N tokenizes to far fewer tokens than "b" * N), so we oversize the
-character repeat then truncate at the token level to land both prefixes at
-exactly PREFIX_TOKENS.
+OLMoE's BPE makes the per-character token count uneven (e.g. "a"*N
+tokenises differently to "b"*N), so we over-generate at the
+character level and then truncate at the token level to land both
+prefixes at exactly PREFIX_TOKENS.
 
-PREFIX_TOKENS is **deliberately one token past 2 × block_size (= 3072)**: with
-exactly 3072 tokens the prompt's *last* block is full block 2, and vLLM does
-not promote a prompt's terminal block to the prefix cache (only block 1 ends
-up cacheable). Empirically that capped the prefix-cache hit rate at ~50% and
-forced 1,536 tokens of recompute per request. PREFIX_TOKENS = 3073 makes
-block 3 the terminal block (1 token, partial) so block 2 is no longer the
-last block and gets hashed → both prefix blocks cache → ~100% hit rate.
+PREFIX_TOKENS is set to one token past 2 * block_size (= 3072) on
+purpose. At exactly 3072 tokens the last block of the prompt is full
+block 2, and vLLM does not promote a prompt's terminal block to the
+prefix cache, so the hit rate caps around 50%. Adding a single token
+makes block 3 the terminal block, so block 2 is no longer last and
+both prefix blocks end up cached.
 
 Run once before the benchmark:
     python make_alternating_prompts.py

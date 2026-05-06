@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GPU-resident LRU cache for MoE expert weights.
+"""LRU cache for MoE expert weights on the GPU.
 
-All experts permanently live on CPU pinned RAM. The GPU has a small cache
-(``cache_size`` slots) where replicas of hot experts live. On a cache miss
-we DMA-copy from CPU pinned → GPU, evicting the LRU expert's replica.
+Experts live on CPU pinned memory and the GPU keeps a fixed number of
+slots holding the most recently used ones. A miss copies the expert from
+CPU to GPU and evicts the least recently used slot that is not needed
+this batch.
 """
 
 import os
@@ -16,26 +17,16 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Trace gate resolved once at module load — the per-step print fires
-# per layer per forward step so a per-call ``os.environ.get`` was a
-# measurable latency tax on the static expert-offload path. Enable
-# with ``VLLM_EXPERT_CACHE_TRACE=1`` only when the trace is actually
-# wanted (e.g. for diagnosing routing); leave unset for any timed
-# run.
+# Resolve the trace gate once at module load. The trace fires per layer
+# per forward step, and a per-call os.environ.get was measurable on the
+# expert-offload path. Set VLLM_EXPERT_CACHE_TRACE=1 only when needed.
 _EXPERT_CACHE_TRACE = (
     os.environ.get("VLLM_EXPERT_CACHE_TRACE", "0") == "1"
 )
 
 
 class ExpertCache:
-    """LRU cache that keeps hot expert weight replicas on GPU.
-
-    Args:
-        cache_size: Number of expert slots to keep on GPU.
-        cpu_w13: CPU-pinned tensor ``[num_experts, ...]`` (gate+up weights).
-        cpu_w2: CPU-pinned tensor ``[num_experts, ...]`` (down weights).
-        device: Target CUDA device for the GPU cache buffers.
-    """
+    """Holds a small set of expert weights on GPU and pages the rest in from CPU."""
 
     def __init__(
         self,
@@ -55,7 +46,6 @@ class ExpertCache:
             f"({self.num_experts})"
         )
 
-        # Allocate GPU cache buffers
         self.cache_w13 = torch.empty(
             (cache_size, *cpu_w13.shape[1:]),
             dtype=cpu_w13.dtype,
@@ -67,23 +57,20 @@ class ExpertCache:
             device=device,
         )
 
-        # LRU tracking
         self.expert_to_slot: dict[int, int] = {}
-        # OrderedDict: oldest-first iteration order
+        # OrderedDict iterates oldest-first, which is what we need for LRU.
         self.lru_order: OrderedDict[int, None] = OrderedDict()
 
-        # Dedicated DMA stream for async CPU→GPU copies
+        # Use a separate stream so CPU->GPU copies don't block the compute stream.
         self.transfer_stream = torch.cuda.Stream(device=device)
 
-        # Stats
         self.hits = 0
         self.misses = 0
 
-        # Pre-populate cache with experts 0..cache_size-1
         self._warm_cache()
 
     def _warm_cache(self) -> None:
-        """Copy first ``cache_size`` experts from CPU→GPU."""
+        """Load experts 0..cache_size-1 into the cache slots."""
         for slot in range(self.cache_size):
             expert_id = slot
             self.cache_w13[slot].copy_(self.cpu_w13[expert_id])
@@ -102,28 +89,13 @@ class ExpertCache:
         )
 
     def ensure_experts_loaded(self, needed_expert_ids: list[int]) -> None:
-        """Ensure all ``needed_expert_ids`` are present in the GPU cache.
+        """Load any missing experts into the GPU cache.
 
-        Uses a two-pass approach to avoid evicting an expert that is itself
-        needed in the same batch:
-          Pass 1 — classify each expert as a hit or miss.
-          Pass 2 — for each miss, evict the coldest cached expert that is
-                   not in the needed set (walking lru_order LRU→MRU so the
-                   hottest non-needed survivors are preserved), then assign
-                   that slot to the incoming expert.
-          Pass 3 — batch all CPU→GPU DMA copies on the transfer stream and
-                   make the compute stream wait.
-
-        After this call returns, the compute stream is safe to read from
-        the cache slots for all ``needed_expert_ids``.
-
-        # TODO: consider coalescing per-expert cudaMemcpyAsync calls into
-        # fewer larger transfers if expert tensors are small and miss counts
-        # are high.
+        Eviction skips experts that are themselves in needed_expert_ids so
+        we don't evict and then immediately reload the same weight.
         """
         needed_set = set(needed_expert_ids)
 
-        # --- Pass 1: classify hits and misses ---
         missing_expert_ids: list[int] = []
         hit_ids: list[int] = []
         for expert_id in needed_expert_ids:
@@ -144,15 +116,13 @@ class ExpertCache:
         if not missing_expert_ids:
             return
 
-        # --- Pass 2: evict coldest non-needed experts, assign slots ---
-        # lru_order is oldest-first, so iterating from the left gives us
-        # the coldest candidates first — hottest non-needed experts survive.
+        # Walk LRU -> MRU, skipping anything still needed this batch.
         eviction_candidates = iter([
             expert_id
             for expert_id in self.lru_order
             if expert_id not in needed_set
         ])
-        experts_and_slots_to_copy: list[tuple[int, int]] = []  # (expert_id, slot)
+        experts_and_slots_to_copy: list[tuple[int, int]] = []
         for expert_id in missing_expert_ids:
             evicted_expert_id = next(eviction_candidates)
             slot = self.expert_to_slot.pop(evicted_expert_id)
@@ -165,22 +135,20 @@ class ExpertCache:
                 )
 
             self.expert_to_slot[expert_id] = slot
-            self.lru_order[expert_id] = None  # Add as MRU
+            self.lru_order[expert_id] = None
             experts_and_slots_to_copy.append((expert_id, slot))
 
-        # --- Pass 3: batch DMA CPU→GPU ---
         with torch.cuda.stream(self.transfer_stream):
             for expert_id, slot in experts_and_slots_to_copy:
                 self.cache_w13[slot].copy_(self.cpu_w13[expert_id], non_blocking=True)
                 self.cache_w2[slot].copy_(self.cpu_w2[expert_id], non_blocking=True)
 
-        # Make the default (compute) stream wait for transfers
+        # Compute stream waits for the copies to finish before reading the slots.
         torch.cuda.current_stream(self.device).wait_stream(self.transfer_stream)
 
     def mark_recently_used(self, expert_ids: list[int]) -> None:
-        """Move ``expert_ids`` to the MRU end of the LRU list."""
+        """Mark each expert as most recently used."""
         for expert_id in expert_ids:
-            # move_to_end(last=True) makes it the most-recently-used
             self.lru_order.move_to_end(expert_id, last=True)
 
     def log_stats(self) -> None:

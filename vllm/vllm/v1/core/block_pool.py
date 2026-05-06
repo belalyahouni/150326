@@ -180,30 +180,21 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
-        # Callbacks invoked at the end of ``get_new_blocks`` (after any
-        # prefix-hash eviction) with the list of newly allocated block
-        # ids. Used by the unified-pool MVP to invalidate per-layer
-        # expert mappings whose physical bytes the impending KV writes
-        # are about to overwrite. Runs regardless of ``enable_caching``.
+        # Fires at the end of get_new_blocks with the freshly
+        # allocated block ids. The unified pool uses this to drop
+        # expert mappings whose bytes are about to be overwritten.
         self._on_allocation_callbacks: list[Callable[[list[int]], None]] = []
 
-        # Prefix-lifecycle callbacks for the unified-pool LRU. A block
-        # is on the prefix-LRU iff it is in the free queue with a hash
-        # set (i.e. evictable cached prefix). ``on_prefix_added`` fires
-        # when a block enters that state via ``free_blocks``;
-        # ``on_prefix_removed`` fires when it leaves it via ``touch``
-        # (becoming actively pinned again) or via hash-clear in
-        # ``_maybe_evict_cached_block``.
+        # A block is on the prefix LRU when it's in the free queue
+        # with a hash set. on_prefix_added fires when it enters that
+        # state, on_prefix_removed when it leaves (either via touch
+        # or via hash clearing).
         self._on_prefix_added_callbacks: list[Callable[[int], None]] = []
         self._on_prefix_removed_callbacks: list[Callable[[int], None]] = []
 
-        # Optional KV victim selector for unified-pool integration.
-        # When set, ``get_new_blocks`` delegates victim choice to this
-        # callback (which returns N already-dequeued blocks) instead of
-        # doing a naive ``popleft_n`` on the free queue. Lets the
-        # unified pool route KV allocations through its own LRU-based
-        # Tier-1/Tier-2 selection, rather than blindly taking whatever
-        # is at the queue front. None for non-unified-pool deployments.
+        # Override for KV victim selection. When set, get_new_blocks
+        # asks this callback for N already-dequeued blocks instead of
+        # popping the front of the queue. Used by the unified pool.
         self._kv_victim_selector: Callable[[int], list[KVCacheBlock]] | None = None
 
     def get_cached_block(
@@ -377,10 +368,8 @@ class BlockPool:
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
 
-        # Notify on-allocation listeners (unified-pool MVP). The prefix
-        # hash has already been cleared by ``_maybe_evict_cached_block``
-        # above, so listeners only need to handle expert-side per-layer
-        # invalidation.
+        # Hash clearing already happened above, so listeners only
+        # need to deal with expert-side invalidation.
         if self._on_allocation_callbacks:
             block_ids = [block.block_id for block in ret]
             for cb in self._on_allocation_callbacks:
@@ -390,17 +379,12 @@ class BlockPool:
     def register_kv_victim_selector(
         self, callback: Callable[[int], list[KVCacheBlock]]
     ) -> None:
-        """Route KV-allocation victim choice through ``callback``.
+        """Replace the default KV victim picker with callback.
 
-        Once set, ``get_new_blocks(n)`` delegates to ``callback(n)``
-        instead of ``free_block_queue.popleft_n(n)``. The callback
-        must return exactly ``n`` blocks already removed from the
-        free queue. Post-selection housekeeping in ``get_new_blocks``
-        (hash clearing via ``_maybe_evict_cached_block``, ref-count,
-        on-allocation listeners) runs unchanged on whatever the
-        callback returns. Used by the unified pool to route KV
-        demand through its LRU-based victim selector. Idempotent
-        replacement; only one selector is supported.
+        get_new_blocks(n) will then call callback(n), which must
+        return exactly n blocks already removed from the free queue.
+        The rest of get_new_blocks (hash clearing, ref counts,
+        listeners) runs unchanged. Only one selector is supported.
         """
         self._kv_victim_selector = callback
 
@@ -431,11 +415,8 @@ class BlockPool:
 
         block.reset_hash()
 
-        # Hash just cleared → no longer a prefix LRU entry. Notify the
-        # unified pool so it removes this block from its prefix-recency
-        # list. Fires for both KV-allocation eviction (via
-        # ``get_new_blocks``) and expert-side eviction (via
-        # ``evict_prefix_hash``).
+        # The block is no longer a prefix LRU entry; let the unified
+        # pool know so it can drop it from its recency list.
         if self._on_prefix_removed_callbacks:
             for cb in self._on_prefix_removed_callbacks:
                 cb(block.block_id)
@@ -466,10 +447,9 @@ class BlockPool:
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
-                # Block transitioning from "cached prefix in free
-                # queue" to "actively pinned" — drop it from the
-                # prefix LRU. (When all refs release, ``free_blocks``
-                # will re-add it.)
+                # Going from "cached prefix in free queue" to
+                # "actively pinned"; drop from the prefix LRU.
+                # free_blocks will put it back when refs hit 0.
                 if (
                     block.block_hash is not None
                     and self._on_prefix_removed_callbacks
@@ -498,11 +478,9 @@ class BlockPool:
             if block.ref_cnt == 0 and not block.is_null
         ]
         self.free_block_queue.append_n(newly_freed)
-        # Any block now back in the queue with a hash is an evictable
-        # cached prefix → notify the prefix LRU. The bump-on-free is
-        # the bump-on-hit signal for prefix recency: a request just
-        # finished using these bytes, so this is their freshest
-        # last-used timestamp.
+        # Anything just freed with a hash is an evictable cached
+        # prefix; notify the prefix LRU so it can stamp the block
+        # with a fresh last-used time.
         if self._on_prefix_added_callbacks:
             for block in newly_freed:
                 if block.block_hash is None:
@@ -513,43 +491,27 @@ class BlockPool:
     def register_on_allocation_callback(
         self, callback: Callable[[list[int]], None]
     ) -> None:
-        """Register a callback fired at the end of ``get_new_blocks``.
-
-        The callback receives the list of block ids that have just been
-        allocated (and whose prefix hashes have already been cleared).
-        Used by the unified-pool MVP to invalidate per-layer expert
-        mappings at those blocks before KV writes overwrite the bytes.
-        """
+        """Register a callback fired with the freshly allocated block ids."""
         self._on_allocation_callbacks.append(callback)
 
     def register_on_prefix_added_callback(
         self, callback: Callable[[int], None]
     ) -> None:
-        """Register a callback fired when a block re-enters the free
-        queue with a hash set (i.e. became an evictable cached-prefix
-        entry). Used by the unified-pool prefix LRU to bump the entry
-        to MRU on its hit-recency list.
-        """
+        """Register a callback fired when a block becomes an evictable cached
+        prefix (back in the free queue with a hash set)."""
         self._on_prefix_added_callbacks.append(callback)
 
     def register_on_prefix_removed_callback(
         self, callback: Callable[[int], None]
     ) -> None:
-        """Register a callback fired when a block stops being an
-        evictable cached-prefix entry — either because it left the
-        free queue (``touch`` pinned it) or because its hash was
-        cleared (``_maybe_evict_cached_block``).
-        """
+        """Register a callback fired when a block stops being an evictable
+        cached prefix (touched into pinned use, or its hash got cleared)."""
         self._on_prefix_removed_callbacks.append(callback)
 
     def evict_prefix_hash(self, block_id: int) -> bool:
-        """Evict the cached prefix hash at ``block_id`` if any.
-
-        The cached prefix is global; once any layer overwrites its
-        bytes the prefix is broken everywhere. The unified pool calls
-        this when an expert miss reuses a previously cached-prefix
-        block. Returns True if a hash was cleared.
-        """
+        """Clear the cached prefix hash at block_id if any. Returns True if a
+        hash was cleared. The unified pool calls this when an expert miss
+        reuses a previously cached-prefix block."""
         block = self.blocks[block_id]
         return self._maybe_evict_cached_block(block)
 

@@ -1,8 +1,8 @@
-"""Generate 10 distinct simple-prefix prompts JSONL for the prefix-capacity test.
+"""Generate 10 single-character prefix prompts for the prefix-capacity test.
 
-Each prompt is a different single character repeated to exactly 3,073 tokens
-(2 full blocks at block_size=1536, plus 1 token to make block 2 hashable per
-the boundary fix from `make_alternating_prompts.py`).
+Each prompt repeats a different character to exactly 3,073 tokens:
+two full blocks at block_size=1536 plus one token so block 2 is
+not the last block (same reason as in make_alternating_prompts.py).
 
 Run once before the benchmark:
     python make_many_prefixes.py
